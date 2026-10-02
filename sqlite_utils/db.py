@@ -468,6 +468,10 @@ class TransactionError(Exception):
     "Operation cannot be performed while a transaction is open"
 
 
+class FTSUnsupportedError(Exception):
+    "FTS layout cannot be reliably understood, so it cannot be repaired"
+
+
 class DescIndex(str):
     pass
 
@@ -477,6 +481,80 @@ class BadMultiValues(Exception):
 
     def __init__(self, values: object) -> None:
         self.values = values
+
+
+# Health check issue codes reported by Table.check_fts()
+FTS_ISSUE_CONTENT_MISMATCH = "content-mismatch"
+FTS_ISSUE_MISSING_TRIGGERS = "missing-triggers"
+FTS_ISSUE_TRIGGER_MISMATCH = "trigger-mismatch"
+FTS_ISSUE_UNSUPPORTED_LAYOUT = "unsupported-layout"
+
+# Actions that Table.repair_fts() can report
+FTS_ACTION_REBUILD_INDEX = "rebuild-index"
+FTS_ACTION_RECREATE_TRIGGERS = "recreate-triggers"
+
+
+@dataclass
+class FTSHealthReport:
+    "Result of Table.check_fts() - see that method for details"
+
+    table: str
+    fts_table: str | None
+    healthy: bool
+    issues: list[str] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class FTSRepairResult:
+    "Result of Table.repair_fts() - see that method for details"
+
+    repaired: bool
+    actions: list[str] = field(default_factory=list)
+    report: FTSHealthReport | None = None
+
+
+_fts_content_option_re = re.compile(
+    r"""\bcontent\s*=\s*(?: "([^"]*)" | '([^']*)' | \[([^\]]*)\] | ([^\s,]+) )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _fts_sync_trigger_sql(table_name: str, columns: Iterable[str]) -> dict[str, str]:
+    """
+    Return ``{trigger_name: sql}`` for the three synchronization triggers that
+    ``Table.enable_fts(create_triggers=True)`` creates for an external content
+    FTS table.
+    """
+    columns = list(columns)
+    old_cols = ", ".join(f"old.{quote_identifier(c)}" for c in columns)
+    new_cols = ", ".join(f"new.{quote_identifier(c)}" for c in columns)
+    columns_quoted = ", ".join(quote_identifier(c) for c in columns)
+    table = quote_identifier(table_name)
+    table_fts = quote_identifier(table_name + "_fts")
+    triggers: dict[str, str] = {}
+    triggers[table_name + "_ai"] = (
+        f"CREATE TRIGGER {quote_identifier(table_name + '_ai')} AFTER INSERT ON {table} BEGIN\n"
+        f"  INSERT INTO {table_fts} (rowid, {columns_quoted}) VALUES (new.rowid, {new_cols});\n"
+        "END"
+    )
+    triggers[table_name + "_ad"] = (
+        f"CREATE TRIGGER {quote_identifier(table_name + '_ad')} AFTER DELETE ON {table} BEGIN\n"
+        f"  INSERT INTO {table_fts} ({table_fts}, rowid, {columns_quoted}) VALUES('delete', old.rowid, {old_cols});\n"
+        "END"
+    )
+    triggers[table_name + "_au"] = (
+        f"CREATE TRIGGER {quote_identifier(table_name + '_au')} AFTER UPDATE ON {table} BEGIN\n"
+        f"  INSERT INTO {table_fts} ({table_fts}, rowid, {columns_quoted}) VALUES('delete', old.rowid, {old_cols});\n"
+        f"  INSERT INTO {table_fts} (rowid, {columns_quoted}) VALUES (new.rowid, {new_cols});\n"
+        "END"
+    )
+    return triggers
+
+
+def _trigger_sql_matches(existing_sql: str, expected_sql: str) -> bool:
+    "Compare two trigger definitions ignoring whitespace differences"
+    return " ".join(existing_sql.split()) == " ".join(expected_sql.split())
 
 
 _COUNTS_TABLE_CREATE_SQL = """
@@ -3810,37 +3888,9 @@ class Table(Queryable):
         self.populate_fts(columns)
 
         if create_triggers:
-            old_cols = ", ".join(f"old.{quote_identifier(c)}" for c in columns)
-            new_cols = ", ".join(f"new.{quote_identifier(c)}" for c in columns)
-            columns_quoted = ", ".join(quote_identifier(c) for c in columns)
-            table = quote_identifier(self.name)
-            table_fts = quote_identifier(self.name + "_fts")
-            triggers = (
-                textwrap.dedent("""
-                CREATE TRIGGER {table_ai} AFTER INSERT ON {table} BEGIN
-                  INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
-                END;
-                CREATE TRIGGER {table_ad} AFTER DELETE ON {table} BEGIN
-                  INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
-                END;
-                CREATE TRIGGER {table_au} AFTER UPDATE ON {table} BEGIN
-                  INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
-                  INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
-                END;
-            """)
-                .strip()
-                .format(
-                    table=table,
-                    table_fts=table_fts,
-                    table_ai=quote_identifier(self.name + "_ai"),
-                    table_ad=quote_identifier(self.name + "_ad"),
-                    table_au=quote_identifier(self.name + "_au"),
-                    columns=columns_quoted,
-                    old_cols=old_cols,
-                    new_cols=new_cols,
-                )
+            self.db.executescript(
+                ";\n".join(_fts_sync_trigger_sql(self.name, columns).values()) + ";"
             )
-            self.db.executescript(triggers)
         return self
 
     def populate_fts(self, columns: Iterable[str]) -> "Table":
@@ -3900,6 +3950,208 @@ class Table(Queryable):
                 )
             )
         return self
+
+    def check_fts(self) -> FTSHealthReport:
+        """
+        Check the health of the FTS5 external content index for this table.
+
+        Returns an :class:`FTSHealthReport` describing any problems found.
+        ``report.issues`` is a list which can contain the following codes:
+
+        - ``"content-mismatch"`` - rows in this table are missing from the
+          search index, or the index contains rows that no longer exist
+          (detected by comparing rowids against the FTS ``%_docsize``
+          shadow table)
+        - ``"missing-triggers"`` - one or more of the ``_ai``/``_ad``/``_au``
+          synchronization triggers are absent
+        - ``"trigger-mismatch"`` - triggers with those names exist but their
+          definitions differ from what sqlite-utils would create
+        - ``"unsupported-layout"`` - the FTS configuration is not an FTS5
+          external content table managed by this library, so its health
+          cannot be reliably determined
+
+        Only FTS5 external content tables (created for example by
+        :ref:`python_api_fts_enable`) are supported. ``report.details``
+        carries extra information such as the confirmed ``columns``,
+        ``missing_rowids``/``orphaned_rowids`` samples and the names of
+        ``missing_triggers``/``mismatched_triggers``.
+        """
+        fts_table = self.detect_fts()
+        if fts_table is None:
+            return FTSHealthReport(
+                table=self.name,
+                fts_table=None,
+                healthy=False,
+                issues=[FTS_ISSUE_UNSUPPORTED_LAYOUT],
+                details={"reason": "no FTS table found for this table"},
+            )
+        fts = self.db[fts_table]
+        using = fts.virtual_table_using
+        if using != "FTS5":
+            return FTSHealthReport(
+                table=self.name,
+                fts_table=fts_table,
+                healthy=False,
+                issues=[FTS_ISSUE_UNSUPPORTED_LAYOUT],
+                details={
+                    "reason": (
+                        "only FTS5 external content tables are supported, "
+                        "found {}".format(using or "a non-virtual table")
+                    )
+                },
+            )
+        content_match = _fts_content_option_re.search(fts.schema or "")
+        content_table = None
+        if content_match is not None:
+            content_table = next(
+                group for group in content_match.groups() if group is not None
+            )
+        if not content_table:
+            return FTSHealthReport(
+                table=self.name,
+                fts_table=fts_table,
+                healthy=False,
+                issues=[FTS_ISSUE_UNSUPPORTED_LAYOUT],
+                details={
+                    "reason": (
+                        "could not confirm an external content table in the "
+                        "FTS definition - it may be contentless or standalone"
+                    )
+                },
+            )
+        if content_table != self.name:
+            return FTSHealthReport(
+                table=self.name,
+                fts_table=fts_table,
+                healthy=False,
+                issues=[FTS_ISSUE_UNSUPPORTED_LAYOUT],
+                details={
+                    "reason": (
+                        f"FTS table indexes content={content_table!r}, "
+                        "not this table"
+                    )
+                },
+            )
+        columns = [column.name for column in fts.columns]
+        if not columns:
+            return FTSHealthReport(
+                table=self.name,
+                fts_table=fts_table,
+                healthy=False,
+                issues=[FTS_ISSUE_UNSUPPORTED_LAYOUT],
+                details={"reason": "could not determine the indexed columns"},
+            )
+        # The %_docsize shadow table holds one row per indexed document -
+        # it is the only reliable way to see which rowids the index holds,
+        # since queries against an external content FTS table pass through
+        # to the content table. It does not exist for columnsize=0 tables.
+        docsize_table = fts_table + "_docsize"
+        if not self.db[docsize_table].exists():
+            return FTSHealthReport(
+                table=self.name,
+                fts_table=fts_table,
+                healthy=False,
+                issues=[FTS_ISSUE_UNSUPPORTED_LAYOUT],
+                details={
+                    "reason": (
+                        f"shadow table {docsize_table!r} is missing - the "
+                        "index contents cannot be inspected (columnsize=0?)"
+                    )
+                },
+            )
+        issues: list[str] = []
+        details: dict[str, Any] = {"columns": columns}
+        table_quoted = quote_identifier(self.name)
+        docsize_quoted = quote_identifier(docsize_table)
+        # Compare rowids in the table against rowids present in the index
+        missing_rowids = [
+            row[0]
+            for row in self.db.execute(
+                f"SELECT rowid FROM {table_quoted} EXCEPT SELECT id FROM {docsize_quoted}"
+            ).fetchall()
+        ]
+        orphaned_rowids = [
+            row[0]
+            for row in self.db.execute(
+                f"SELECT id FROM {docsize_quoted} EXCEPT SELECT rowid FROM {table_quoted}"
+            ).fetchall()
+        ]
+        if missing_rowids or orphaned_rowids:
+            issues.append(FTS_ISSUE_CONTENT_MISMATCH)
+            details["missing_rowids"] = missing_rowids
+            details["orphaned_rowids"] = orphaned_rowids
+        # Triggers are judged by their definitions, not just their names
+        expected_triggers = _fts_sync_trigger_sql(self.name, columns)
+        existing_triggers = self.triggers_dict
+        missing_triggers = [
+            name for name in expected_triggers if name not in existing_triggers
+        ]
+        mismatched_triggers = [
+            name
+            for name, sql in expected_triggers.items()
+            if name in existing_triggers
+            and not _trigger_sql_matches(existing_triggers[name], sql)
+        ]
+        if missing_triggers:
+            issues.append(FTS_ISSUE_MISSING_TRIGGERS)
+            details["missing_triggers"] = missing_triggers
+        if mismatched_triggers:
+            issues.append(FTS_ISSUE_TRIGGER_MISMATCH)
+            details["mismatched_triggers"] = mismatched_triggers
+        return FTSHealthReport(
+            table=self.name,
+            fts_table=fts_table,
+            healthy=not issues,
+            issues=issues,
+            details=details,
+        )
+
+    def repair_fts(self) -> FTSRepairResult:
+        """
+        Repair the FTS5 external content index for this table.
+
+        Runs :meth:`check_fts` first. If the configuration is healthy nothing
+        is changed. Otherwise, in a single transaction, the index is rebuilt
+        from the confirmed FTS configuration and the ``_ai``/``_ad``/``_au``
+        synchronization triggers managed by this library are recreated.
+        Other triggers on the table are left untouched.
+
+        Raises :class:`FTSUnsupportedError` if the FTS layout cannot be
+        reliably understood - no SQL is guessed in that case.
+
+        Returns an :class:`FTSRepairResult` with the actions taken and the
+        health report after the repair.
+        """
+        report = self.check_fts()
+        if FTS_ISSUE_UNSUPPORTED_LAYOUT in report.issues:
+            raise FTSUnsupportedError(
+                f"Cannot repair FTS for table {self.name!r}: "
+                + report.details.get("reason", "unsupported FTS layout")
+            )
+        if report.healthy:
+            return FTSRepairResult(repaired=False, actions=[], report=report)
+        fts_table = cast(str, report.fts_table)
+        columns = report.details["columns"]
+        actions: list[str] = []
+        with self.db.atomic():
+            # A tampered trigger may have silently desynchronized the index
+            # in ways a rowid comparison cannot see, so rebuild on any issue
+            self.db.execute(
+                "INSERT INTO {table}({table}) VALUES('rebuild');".format(
+                    table=quote_identifier(fts_table)
+                )
+            )
+            actions.append(FTS_ACTION_REBUILD_INDEX)
+            if {
+                FTS_ISSUE_MISSING_TRIGGERS,
+                FTS_ISSUE_TRIGGER_MISMATCH,
+            } & set(report.issues):
+                # Only ever drop the three trigger names this library owns
+                for name, sql in _fts_sync_trigger_sql(self.name, columns).items():
+                    self.db.execute(f"DROP TRIGGER IF EXISTS {quote_identifier(name)}")
+                    self.db.execute(sql)
+                actions.append(FTS_ACTION_RECREATE_TRIGGERS)
+        return FTSRepairResult(repaired=True, actions=actions, report=self.check_fts())
 
     def detect_fts(self) -> str | None:
         "Detect if table has a corresponding FTS virtual table and return it"

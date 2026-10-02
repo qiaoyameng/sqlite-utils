@@ -3008,6 +3008,58 @@ This runs the following SQL::
 .. note::
     In the CLI: :ref:`sqlite-utils rebuild-fts <cli_fts>`
 
+.. _python_api_fts_check:
+
+Checking and repairing FTS table health
+=======================================
+
+External content FTS5 indexes can silently fall out of sync with their content
+table - for example if rows were imported manually while the synchronization
+triggers were missing, or if those triggers were modified by something else.
+
+The ``table.check_fts()`` method inspects the FTS5 external content index for a
+table and returns an ``FTSHealthReport``:
+
+.. code-block:: python
+
+    report = db.table("dogs").check_fts()
+    if not report.healthy:
+        print(report.issues)
+
+``report.issues`` is a list of problem codes, empty if everything is fine:
+
+- ``"content-mismatch"`` - rows are missing from the search index, or the index
+  contains rows that no longer exist in the table
+- ``"missing-triggers"`` - some of the ``_ai``/``_ad``/``_au`` synchronization
+  triggers are absent
+- ``"trigger-mismatch"`` - triggers with those names exist but their
+  definitions differ from what sqlite-utils would create - the name alone is
+  not considered proof of a healthy trigger
+- ``"unsupported-layout"`` - the FTS configuration is not an FTS5 external
+  content table that this library can reliably understand (for example FTS4,
+  contentless or ``columnsize=0`` tables)
+
+``report.details`` provides additional context, such as the confirmed indexed
+``columns``, sample ``missing_rowids``/``orphaned_rowids`` and the names of
+``missing_triggers``/``mismatched_triggers``.
+
+The ``table.repair_fts()`` method fixes a table that failed the check:
+
+.. code-block:: python
+
+    result = db.table("dogs").repair_fts()
+    print(result.actions)
+
+In a single transaction this rebuilds the index from the confirmed FTS
+configuration and recreates the ``_ai``/``_ad``/``_au`` synchronization
+triggers. Other triggers on the table are never touched. If the table is
+already healthy nothing is changed and ``result.actions`` is empty. If the
+transaction fails partway through, the table, its triggers and the previous
+index are left unchanged.
+
+If the FTS layout cannot be reliably understood, ``repair_fts()`` raises
+``sqlite_utils.db.FTSUnsupportedError`` instead of guessing any SQL.
+
 .. _python_api_fts_optimize:
 
 Optimizing a full-text search table
