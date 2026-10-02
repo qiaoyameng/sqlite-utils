@@ -468,6 +468,14 @@ class TransactionError(Exception):
     "Operation cannot be performed while a transaction is open"
 
 
+class ChangeLogGap(Exception):
+    "Requested changes have been deleted and can no longer be read"
+
+
+class ChangeConsumerNotFound(Exception):
+    "The specified change-log consumer has not been registered"
+
+
 class DescIndex(str):
     pass
 
@@ -485,6 +493,224 @@ CREATE TABLE IF NOT EXISTS "{}"(
    count INTEGER DEFAULT 0
 );
 """.strip()
+
+_CHANGES_TABLE_NAME = "_changes"
+_CHANGES_DATA_TABLE_NAME = "_changes_data"
+_CHANGES_CURSORS_TABLE_NAME = "_changes_cursors"
+_CHANGES_STATE_TABLE_NAME = "_changes_state"
+_CHANGES_INTERNAL_TABLES = frozenset(
+    {
+        _CHANGES_TABLE_NAME,
+        _CHANGES_DATA_TABLE_NAME,
+        _CHANGES_CURSORS_TABLE_NAME,
+        _CHANGES_STATE_TABLE_NAME,
+    }
+)
+_CHANGES_TRIGGER_MARKER = "-- sqlite-utils changes"
+_CHANGES_ROWID_FIELD = "__sqlite_utils_rowid__"
+
+OP_INSERT = "INSERT"
+OP_UPDATE = "UPDATE"
+OP_DELETE = "DELETE"
+INSERT = OP_INSERT
+UPDATE = OP_UPDATE
+DELETE = OP_DELETE
+
+_CHANGES_SCHEMA_SQL = f"""
+CREATE TABLE IF NOT EXISTS "{_CHANGES_TABLE_NAME}" (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    "table" TEXT NOT NULL,
+    op TEXT NOT NULL,
+    pk_count INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS "idx_{_CHANGES_TABLE_NAME}_table_id"
+ON "{_CHANGES_TABLE_NAME}" ("table", id);
+CREATE TABLE IF NOT EXISTS "{_CHANGES_DATA_TABLE_NAME}" (
+    event_id INTEGER NOT NULL,
+    field TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    column_position INTEGER NOT NULL,
+    side TEXT NOT NULL,
+    value,
+    PRIMARY KEY (event_id, side, field, position, column_position)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS "idx_{_CHANGES_DATA_TABLE_NAME}_event"
+ON "{_CHANGES_DATA_TABLE_NAME}" (event_id, column_position, side);
+CREATE TABLE IF NOT EXISTS "{_CHANGES_CURSORS_TABLE_NAME}" (
+    consumer TEXT PRIMARY KEY,
+    cursor INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS "{_CHANGES_STATE_TABLE_NAME}" (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
+INSERT OR IGNORE INTO "{_CHANGES_STATE_TABLE_NAME}" (key, value)
+VALUES ('version', '1'), ('pruned_through', '0');
+""".strip()
+
+
+class ChangeEvent(dict):
+    "A single row-level change, with both dictionary keys and attribute access."
+
+    @property
+    def id(self) -> int:
+        return self["id"]
+
+    @property
+    def sequence(self) -> int:
+        return self["id"]
+
+    @property
+    def table(self) -> str:
+        return self["table"]
+
+    @property
+    def op(self) -> str:
+        return self["op"]
+
+    @property
+    def operation(self) -> str:
+        return self["op"]
+
+    @property
+    def old_pk(self) -> Any:
+        return self["old_pk"]
+
+    @property
+    def old_primary_key(self) -> Any:
+        return self["old_pk"]
+
+    @property
+    def new_pk(self) -> Any:
+        return self["new_pk"]
+
+    @property
+    def new_primary_key(self) -> Any:
+        return self["new_pk"]
+
+    @property
+    def old(self) -> dict[str, Any] | None:
+        return self["old"]
+
+    @property
+    def old_values(self) -> dict[str, Any] | None:
+        return self["old"]
+
+    @property
+    def new(self) -> dict[str, Any] | None:
+        return self["new"]
+
+    @property
+    def new_values(self) -> dict[str, Any] | None:
+        return self["new"]
+
+    @property
+    def changed_columns(self) -> list[str]:
+        return self["changed_columns"]
+
+
+class ChangeBatch(list):
+    "A page of change events and the cursor to use when continuing."
+
+    def __init__(self, changes: list[ChangeEvent], next_cursor: int, done: bool):
+        super().__init__(changes)
+        self.next_cursor = next_cursor
+        self.done = done
+
+    def __repr__(self) -> str:
+        return (
+            f"ChangeBatch({list(self)}, next_cursor={self.next_cursor}, "
+            f"done={self.done})"
+        )
+
+    @property
+    def changes(self) -> list[ChangeEvent]:
+        return list(self)
+
+    @property
+    def cursor(self) -> int:
+        return self.next_cursor
+
+    @property
+    def has_more(self) -> bool:
+        return not self.done
+
+
+def _changes_value_rows_sql(
+    *,
+    source: str,
+    side: str,
+    columns: list[tuple[str, str, int, int]],
+    quote_value: Callable[[str], str],
+) -> str:
+    parts = []
+    for field_name, source_column, position, column_position in columns:
+        parts.append(
+            "SELECT last_insert_rowid(), {field}, {position}, "
+            "{column_position}, {side}, {source}.{column}".format(
+                field=quote_value(field_name),
+                position=position,
+                column_position=column_position,
+                side=quote_value(side),
+                source=source,
+                column=source_column,
+            )
+        )
+    return " UNION ALL ".join(parts)
+
+
+def _changes_trigger_sql(
+    *,
+    table_name: str,
+    columns: list[tuple[str, str, int, int]],
+    pk_count: int,
+    quote_value: Callable[[str], str],
+) -> str:
+    table = quote_identifier(table_name)
+    triggers = []
+    for op, source, side in (
+        (OP_INSERT, "NEW", "new"),
+        (OP_UPDATE, "NEW", "new"),
+        (OP_DELETE, "OLD", "old"),
+    ):
+        suffix = op.lower()
+        trigger_name = quote_identifier(f"{table_name}_changes_{suffix}")
+        statements = [
+            'INSERT INTO "{changes_table}" ("table", op, pk_count) '
+            "VALUES ({table_name}, {op}, {pk_count});".format(
+                changes_table=_CHANGES_TABLE_NAME,
+                table_name=quote_value(table_name),
+                op=quote_value(op),
+                pk_count=pk_count,
+            )
+        ]
+        sides = [side]
+        if op == OP_UPDATE:
+            sides = ["old", "new"]
+        value_selects = [
+            _changes_value_rows_sql(
+                source="NEW" if item_side == "new" else "OLD",
+                side=item_side,
+                columns=columns,
+                quote_value=quote_value,
+            )
+            for item_side in sides
+        ]
+        statements.append(
+            'INSERT INTO "{data_table}" '
+            "(event_id, field, position, column_position, side, value) "
+            "{select};".format(
+                data_table=_CHANGES_DATA_TABLE_NAME,
+                select=" UNION ALL ".join(value_selects),
+            )
+        )
+        body = "\n".join(statements)
+        triggers.append(
+            f"CREATE TRIGGER {trigger_name} {_CHANGES_TRIGGER_MARKER}\n"
+            f"AFTER {op} ON {table}\n"
+            f"BEGIN\n{textwrap.indent(body, '    ')}\nEND;"
+        )
+    return "\n".join(triggers)
 
 
 _TRANSACTION_CONTROL_KEYWORDS = {
@@ -1281,6 +1507,409 @@ class Database:
                 {"table": table.name, "count": table.execute_count()}
                 for table in tables
             )
+
+    def _changes_table_exists(self, name: str) -> bool:
+        return name in set(self.table_names())
+
+    def _changes_state_value(
+        self, key: str, default: str | None = None
+    ) -> str | None:
+        if not self._changes_table_exists(_CHANGES_STATE_TABLE_NAME):
+            return default
+        row = self.execute(
+            f'SELECT value FROM {quote_identifier(_CHANGES_STATE_TABLE_NAME)} '
+            "WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return row[0] if row is not None else default
+
+    def _ensure_changes_tables(self) -> None:
+        expected_columns = {
+            _CHANGES_TABLE_NAME: ["id", "table", "op", "pk_count"],
+            _CHANGES_DATA_TABLE_NAME: [
+                "event_id",
+                "field",
+                "position",
+                "column_position",
+                "side",
+                "value",
+            ],
+            _CHANGES_CURSORS_TABLE_NAME: ["consumer", "cursor"],
+            _CHANGES_STATE_TABLE_NAME: ["key", "value"],
+        }
+        existing_internal_tables = {
+            table_name
+            for table_name in expected_columns
+            if self._changes_table_exists(table_name)
+        }
+        if existing_internal_tables:
+            has_version = False
+            if _CHANGES_STATE_TABLE_NAME in existing_internal_tables:
+                has_version = (
+                    self.execute(
+                        f"SELECT 1 FROM {quote_identifier(_CHANGES_STATE_TABLE_NAME)} "
+                        "WHERE key = 'version' AND value = '1'",
+                    ).fetchone()
+                    is not None
+                )
+            if existing_internal_tables != set(expected_columns) or not has_version:
+                raise AlterError(
+                    "A sqlite-utils change-log table already exists without the "
+                    "complete change-log schema"
+                )
+        for table_name, expected in expected_columns.items():
+            if not self._changes_table_exists(table_name):
+                continue
+            columns = [column.name for column in self.table(table_name).columns]
+            if columns != expected:
+                raise AlterError(
+                    f"Table {table_name} exists but is not a sqlite-utils "
+                    "change-log table"
+                )
+        with self.atomic():
+            self._executescript(_CHANGES_SCHEMA_SQL)
+
+    def _changes_trigger(self, table_name: str, operation: str) -> str | None:
+        trigger_name = f"{table_name}_changes_{operation}".lower()
+        row = self.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND lower(name) = ? AND tbl_name = ?",
+            (trigger_name, table_name),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def enable_changes(self, tables: Iterable[str] | None = None) -> None:
+        """
+        Enable row change logging for every eligible table, or named tables.
+        """
+        requested = set(tables) if tables is not None else None
+        requested_folded = (
+            {fold_identifier_case(name) for name in requested}
+            if requested is not None
+            else None
+        )
+        matched: set[str] = set()
+        eligible_tables = []
+        for table in self.tables:
+            if (
+                table.virtual_table_using is None
+                and table.name not in _CHANGES_INTERNAL_TABLES
+                and not table.name.startswith("sqlite_")
+                and not table.name.endswith(
+                    ("_fts_data", "_fts_idx", "_fts_docsize", "_fts_config")
+                )
+                and (
+                    requested_folded is None
+                    or fold_identifier_case(table.name) in requested_folded
+                )
+            ):
+                if requested is not None:
+                    matched.add(fold_identifier_case(table.name))
+                eligible_tables.append(table)
+        if requested_folded is not None and matched != requested_folded:
+            missing = sorted(requested_folded - matched)
+            raise NoTable(f"Table does not exist: {missing[0]}")
+        for table in eligible_tables:
+            for operation in ("insert", "update", "delete"):
+                sql = self._changes_trigger(table.name, operation)
+                if sql is not None and _CHANGES_TRIGGER_MARKER not in sql:
+                    raise AlterError(
+                        f"Trigger {table.name}_changes_{operation} already exists "
+                        "and is not managed by sqlite-utils change logging"
+                    )
+
+        self._ensure_changes_tables()
+        with self.atomic():
+            for table in eligible_tables:
+                table.enable_changes()
+
+    def disable_changes(self, *, drop_log: bool = False) -> None:
+        """
+        Disable row change logging on all tables that use this feature.
+        """
+        with self.atomic():
+            for table in self.tables:
+                if table.has_changes_triggers:
+                    table.disable_changes()
+            if drop_log:
+                for name in (
+                    _CHANGES_DATA_TABLE_NAME,
+                    _CHANGES_TABLE_NAME,
+                    _CHANGES_CURSORS_TABLE_NAME,
+                    _CHANGES_STATE_TABLE_NAME,
+                ):
+                    if self._changes_table_exists(name):
+                        self.execute(f"DROP TABLE {quote_identifier(name)}")
+
+    def _changes_check_cursor_gap(self, cursor: int) -> None:
+        if cursor < 0:
+            raise ValueError("cursor must be greater than or equal to 0")
+        pruned_through = int(
+            self._changes_state_value("pruned_through", "0")
+        )
+        if cursor < pruned_through:
+            raise ChangeLogGap(
+                f"Change-log cursor {cursor} is behind the retained watermark "
+                f"{pruned_through}; events between these points have been deleted"
+            )
+
+    def read_changes(
+        self,
+        cursor: int = 0,
+        *,
+        table: str | None = None,
+        batch_size: int = 100,
+        after: int | None = None,
+        limit: int | None = None,
+    ) -> ChangeBatch:
+        """
+        Read a strictly ordered page of committed row changes after ``cursor``.
+        """
+        if after is not None:
+            if cursor and cursor != after:
+                raise ValueError("specify either cursor or after, not both")
+            cursor = after
+        if limit is not None:
+            batch_size = limit
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero")
+        if not self._changes_table_exists(_CHANGES_TABLE_NAME):
+            return ChangeBatch([], cursor, True)
+        self._changes_check_cursor_gap(cursor)
+
+        params: list[Any] = [cursor]
+        where = "id > ?"
+        if table is not None:
+            where += ' AND "table" = ?'
+            params.append(table)
+        event_rows = self.execute(
+            "SELECT id, \"table\", op, pk_count FROM "
+            f"{quote_identifier(_CHANGES_TABLE_NAME)} "
+            f"WHERE {where} ORDER BY id LIMIT ?",
+            [*params, batch_size + 1],
+        ).fetchall()
+        page_rows = event_rows[:batch_size]
+        if not page_rows:
+            return ChangeBatch([], cursor, True)
+
+        event_ids = [row[0] for row in page_rows]
+        placeholders = ", ".join("?" for _ in event_ids)
+        data_rows = self.execute(
+            "SELECT event_id, field, position, column_position, side, value FROM "
+            f"{quote_identifier(_CHANGES_DATA_TABLE_NAME)} "
+            "WHERE event_id IN ({}) ORDER BY event_id, column_position, side".format(
+                placeholders
+            ),
+            event_ids,
+        ).fetchall()
+        data: dict[int, dict[str, dict[str, Any]]] = {}
+        field_positions: dict[int, dict[str, tuple[int, int]]] = {}
+        for event_id, field, pk_position, column_position, side, value in data_rows:
+            data.setdefault(event_id, {}).setdefault(side, {})[field] = value
+            field_positions.setdefault(event_id, {})[field] = (
+                pk_position,
+                column_position,
+            )
+
+        changes = []
+        for event_id, table_name, op, pk_count in page_rows:
+            sides = data.get(event_id, {})
+            ordered_fields = [
+                (
+                    "rowid" if stored_field == _CHANGES_ROWID_FIELD else stored_field,
+                    stored_field,
+                    pk_position,
+                    column_position,
+                )
+                for stored_field, (pk_position, column_position) in sorted(
+                    field_positions.get(event_id, {}).items(),
+                    key=lambda item: (item[1][1], item[1][0]),
+                )
+            ]
+            pk_fields = [
+                field
+                for field, (pk_position, _column_position) in sorted(
+                    field_positions.get(event_id, {}).items(),
+                    key=lambda item: item[1][0],
+                )
+                if 1 <= pk_position <= pk_count
+            ]
+
+            def make_pk(side: str) -> Any:
+                values = sides.get(side, {})
+                pk_values = [values.get(field) for field in pk_fields]
+                return pk_values[0] if len(pk_values) == 1 else tuple(pk_values)
+
+            def make_values(side: str) -> dict[str, Any] | None:
+                if side not in sides:
+                    return None
+                return {
+                    name: sides[side][field]
+                    for name, field, _pk_position, _column_position in ordered_fields
+                    if field != _CHANGES_ROWID_FIELD and field in sides[side]
+                }
+
+            old_values = make_values("old")
+            new_values = make_values("new")
+            changed_columns = (
+                [
+                    name
+                    for name in new_values
+                    if old_values is None or new_values[name] != old_values.get(name)
+                ]
+                if op == OP_UPDATE and new_values is not None
+                else []
+            )
+            changes.append(
+                ChangeEvent(
+                    {
+                        "id": event_id,
+                        "table": table_name,
+                        "op": op,
+                        "old_pk": make_pk("old") if "old" in sides else None,
+                        "new_pk": make_pk("new") if "new" in sides else None,
+                        "old": old_values,
+                        "new": new_values,
+                        "changed_columns": changed_columns,
+                    }
+                )
+            )
+
+        has_more = len(event_rows) > batch_size
+        next_cursor = event_ids[-1]
+        return ChangeBatch(changes, next_cursor, not has_more)
+
+    def create_change_consumer(self, consumer: str, cursor: int = 0) -> None:
+        "Register a named change-log consumer at the supplied cursor."
+        if cursor < 0:
+            raise ValueError("cursor must be greater than or equal to 0")
+        self._ensure_changes_tables()
+        self._changes_check_cursor_gap(cursor)
+        with self.atomic():
+            self.execute(
+                "INSERT OR IGNORE INTO "
+                f"{quote_identifier(_CHANGES_CURSORS_TABLE_NAME)} "
+                "(consumer, cursor) VALUES (?, ?)",
+                (consumer, cursor),
+            )
+
+    def acknowledge_changes(self, consumer: str, cursor: int) -> None:
+        """
+        Advance a named consumer's confirmed change-log cursor.
+        """
+        self._changes_check_cursor_gap(cursor)
+        if not self._changes_table_exists(_CHANGES_CURSORS_TABLE_NAME):
+            raise ChangeConsumerNotFound(
+                f"Unknown change-log consumer: {consumer}"
+            )
+        current_cursor = self.change_consumer_cursor(consumer)
+        if current_cursor is None:
+            raise ChangeConsumerNotFound(
+                f"Unknown change-log consumer: {consumer}"
+            )
+        if cursor < current_cursor:
+            raise ValueError(
+                "Cannot move change-log cursor backwards from "
+                f"{current_cursor} to {cursor}"
+            )
+        with self.atomic():
+            self.execute(
+                f"UPDATE {quote_identifier(_CHANGES_CURSORS_TABLE_NAME)} "
+                "SET cursor = ? WHERE consumer = ?",
+                (cursor, consumer),
+            )
+
+    def change_consumer_cursor(self, consumer: str) -> int | None:
+        "Return the acknowledged cursor for a consumer, or ``None`` if unknown."
+        if not self._changes_table_exists(_CHANGES_CURSORS_TABLE_NAME):
+            return None
+        row = self.execute(
+            f"SELECT cursor FROM {quote_identifier(_CHANGES_CURSORS_TABLE_NAME)} "
+            "WHERE consumer = ?",
+            (consumer,),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def prune_changes(
+        self,
+        *,
+        consumer: str | None = None,
+        cursor: int | None = None,
+    ) -> int:
+        """
+        Delete change events through the minimum confirmed consumer watermark.
+        """
+        if consumer is not None and cursor is not None:
+            raise ValueError("specify either consumer or cursor, not both")
+        if consumer is not None:
+            cutoff = self.change_consumer_cursor(consumer)
+            if cutoff is None:
+                raise ChangeConsumerNotFound(
+                    f"Unknown change-log consumer: {consumer}"
+                )
+        elif cursor is not None:
+            if cursor < 0:
+                raise ValueError("cursor must be greater than or equal to 0")
+            cutoff = cursor
+        else:
+            if self._changes_table_exists(_CHANGES_CURSORS_TABLE_NAME):
+                row = self.execute(
+                    "SELECT MIN(cursor) FROM "
+                    f"{quote_identifier(_CHANGES_CURSORS_TABLE_NAME)}"
+                ).fetchone()
+            else:
+                row = None
+            cutoff = row[0] if row is not None else 0
+
+        deleted = 0
+        self._ensure_changes_tables()
+        with self.atomic():
+            first_id, last_id = self.execute(
+                f"SELECT MIN(id), MAX(id) FROM {quote_identifier(_CHANGES_TABLE_NAME)}"
+            ).fetchone()
+            deleted = self.execute(
+                f"SELECT COUNT(*) FROM {quote_identifier(_CHANGES_TABLE_NAME)} "
+                "WHERE id <= ?",
+                (cutoff,),
+            ).fetchone()[0]
+            self.execute(
+                f"DELETE FROM {quote_identifier(_CHANGES_DATA_TABLE_NAME)} "
+                "WHERE event_id <= ?",
+                (cutoff,),
+            )
+            self._ensure_changes_tables()
+            self.execute(
+                f"DELETE FROM {quote_identifier(_CHANGES_TABLE_NAME)} WHERE id <= ?",
+                (cutoff,),
+            )
+            advance_watermark = deleted > 0 or (
+                cutoff > 0 and first_id is not None and cutoff >= first_id
+            )
+            if advance_watermark:
+                watermark = min(cutoff, last_id) if last_id is not None else cutoff
+                self.execute(
+                    f"UPDATE {quote_identifier(_CHANGES_STATE_TABLE_NAME)} "
+                    "SET value = ? WHERE key = 'pruned_through'",
+                    (
+                        str(
+                            max(
+                                int(
+                                    self._changes_state_value(
+                                        "pruned_through", "0"
+                                    )
+                                ),
+                                watermark,
+                            )
+                        ),
+                    ),
+                )
+        return deleted
+
+    changes = read_changes
+    enable_change_log = enable_changes
+    disable_change_log = disable_changes
+    confirm_changes = acknowledge_changes
+    cleanup_changes = prune_changes
 
     def execute_returning_dicts(
         self, sql: str, params: Sequence | dict[str, Any] | None = None
@@ -3750,6 +4379,128 @@ class Table(Queryable):
             for suffix in ["insert", "delete"]
         }
         return trigger_names.issubset(self.triggers_dict.keys())
+
+    def _changes_columns(self) -> list[tuple[str, str, int, int]]:
+        pk_names = self.pks
+        declared_pk_columns = {
+            column.name
+            for column in self.columns
+            if column.is_pk
+            and column.type.upper() == "INTEGER"
+        }
+        if (
+            self.use_rowid
+            and len(pk_names) == 1
+            and pk_names[0] not in declared_pk_columns
+        ):
+            pk_names = [_CHANGES_ROWID_FIELD]
+        pk_set = {column.name for column in self.columns if column.is_pk}
+        column_positions = {
+            column.name: column.cid + 1 for column in self.columns
+        }
+        columns = []
+        for position, name in enumerate(pk_names, start=1):
+            source_name = name
+            source_column = (
+                "_rowid_"
+                if source_name == _CHANGES_ROWID_FIELD
+                else quote_identifier(name)
+            )
+            column_position = (
+                0 if source_name == _CHANGES_ROWID_FIELD else column_positions[name]
+            )
+            columns.append(
+                (source_name, source_column, position, column_position)
+            )
+        for column in self.columns:
+            if column.name not in pk_set:
+                next_position = len(columns) + 1
+                columns.append(
+                    (
+                        column.name,
+                        quote_identifier(column.name),
+                        next_position,
+                        column.cid + 1,
+                    )
+                )
+        return columns
+
+    def enable_changes(self) -> None:
+        """
+        Install triggers that record inserts, updates and deletes for this table.
+        """
+        if not self.exists():
+            raise NoTable(f"Table {self.name} does not exist")
+        if self.virtual_table_using is not None:
+            raise AlterError("Change logging is not supported for virtual tables")
+
+        for operation in ("insert", "update", "delete"):
+            sql = self.db._changes_trigger(self.name, operation)
+            if sql is not None and _CHANGES_TRIGGER_MARKER not in sql:
+                raise AlterError(
+                    f"Trigger {self.name}_changes_{operation} already exists and is "
+                    "not managed by sqlite-utils change logging"
+                )
+
+        self.db._ensure_changes_tables()
+        sql = _changes_trigger_sql(
+            table_name=self.name,
+            columns=self._changes_columns(),
+            pk_count=len(self.pks),
+            quote_value=self.db.quote,
+        )
+        with self.db.atomic():
+            for operation in ("insert", "update", "delete"):
+                trigger_name = f"{self.name}_changes_{operation}"
+                self.db.execute(
+                    f"DROP TRIGGER IF EXISTS {quote_identifier(trigger_name)}"
+                )
+            self.db._executescript(sql)
+
+    @property
+    def has_changes_triggers(self) -> bool:
+        "Does this table have sqlite-utils change-logging triggers?"
+        for operation in ("insert", "update", "delete"):
+            sql = self.db._changes_trigger(self.name, operation)
+            if sql is None or _CHANGES_TRIGGER_MARKER not in sql:
+                return False
+        return True
+
+    def disable_changes(self) -> None:
+        "Remove only this table's sqlite-utils change-logging triggers."
+        with self.db.atomic():
+            for operation in ("insert", "update", "delete"):
+                sql = self.db._changes_trigger(self.name, operation)
+                if sql is not None and _CHANGES_TRIGGER_MARKER in sql:
+                    trigger_name = f"{self.name}_changes_{operation}"
+                    self.db.execute(
+                        f"DROP TRIGGER IF EXISTS {quote_identifier(trigger_name)}"
+                    )
+
+    def read_changes(
+        self,
+        cursor: int = 0,
+        batch_size: int = 100,
+        *,
+        after: int | None = None,
+        limit: int | None = None,
+    ) -> ChangeBatch:
+        """
+        Read a page of changes for this table after the supplied cursor.
+        """
+        if after is not None:
+            if cursor and cursor != after:
+                raise ValueError("specify either cursor or after, not both")
+            cursor = after
+        if limit is not None:
+            batch_size = limit
+        return self.db.read_changes(
+            table=self.name, cursor=cursor, batch_size=batch_size
+        )
+
+    changes = read_changes
+    enable_change_log = enable_changes
+    disable_change_log = disable_changes
 
     def enable_fts(
         self,
