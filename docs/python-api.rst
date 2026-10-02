@@ -2854,6 +2854,32 @@ To remove the FTS tables and triggers you created, use the ``disable_fts()`` tab
 .. note::
     In the CLI: :ref:`sqlite-utils enable-fts <cli_fts>`
 
+.. _python_api_fts_health:
+
+Checking and repairing FTS indexes
+-----------------------------------
+
+An FTS index can fall out of sync with its content table - for example if rows were imported while the synchronization triggers were missing, or if those triggers were modified. The ``check_fts_health()`` table method reports on the health of an FTS5 external content index:
+
+.. code-block:: python
+
+    report = db.table("dogs").check_fts_health()
+    report.ok                  # True if no problems were detected
+    report.index_mismatch      # True if the index does not match the table content
+    report.missing_triggers    # Expected sync triggers that are absent
+    report.mismatched_triggers # Triggers with expected names but different definitions
+    report.unsupported         # Set if the FTS layout cannot be verified
+
+Trigger health is determined by comparing full trigger definitions, not just their names. The check only supports FTS5 external content tables - FTS4 tables, contentless tables and other layouts are reported as ``unsupported``.
+
+The ``repair_fts()`` table method fixes any reported problems in a single transaction: it rebuilds the index from the table content and recreates any missing or mismatched synchronization triggers, leaving other triggers on the table untouched. If the index is already healthy nothing is changed:
+
+.. code-block:: python
+
+    report = db.table("dogs").repair_fts()
+
+``repair_fts()`` raises ``sqlite_utils.db.FtsRepairError`` without modifying anything if the layout is unsupported, or if a trigger with an expected name has a custom definition that cannot be reliably identified as a broken synchronization trigger.
+
 .. _python_api_quote_fts:
 
 Quoting characters for use in search

@@ -69,6 +69,23 @@ ROWID_ALIASES = frozenset({"rowid", "_rowid_", "oid"})
 
 _quote_fts_re = re.compile(r'\s+|(".*?")')
 
+_fts5_content_option_re = re.compile(
+    r"""
+    \bcontent\s*=\s*(?:
+        "(?P<dquoted>(?:[^"]|"")*)" |
+        '(?P<squoted>(?:[^']|'')*)' |
+        \[(?P<bracketed>[^\]]*)\] |
+        (?P<bare>[^\s,)'"]+)
+    )
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+
+_fts5_tokenize_option_re = re.compile(
+    r"""\btokenize\s*=\s*((?:'[^']*')|(?:"[^"]*")|(?:\[[^\]]*\])|(?:[^\s,)]+))""",
+    re.IGNORECASE,
+)
+
 _virtual_table_using_re = re.compile(
     r"""
 ^ # Start of string
@@ -322,6 +339,74 @@ XIndexColumn = namedtuple(
 Trigger = namedtuple("Trigger", ("name", "table", "sql"))
 
 
+@dataclass
+class FtsHealthReport:
+    """
+    Result of :meth:`Table.check_fts_health` for an FTS5 external content table.
+
+    ``ok`` is ``True`` only when the index matches the content table and the
+    expected synchronization triggers are present with the correct definitions.
+    """
+
+    table: str
+    fts_table: str
+    columns: list[str]
+    index_mismatch: bool = False
+    missing_triggers: list[str] = field(default_factory=list)
+    mismatched_triggers: list[str] = field(default_factory=list)
+    unsupported: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        "``True`` if no problems were detected."
+        return (
+            not self.index_mismatch
+            and not self.missing_triggers
+            and not self.mismatched_triggers
+            and self.unsupported is None
+        )
+
+
+def _parse_fts5_content_option(sql: str) -> str | None:
+    "Return the unquoted value of the ``content=`` option in an FTS5 CREATE statement."
+    match = _fts5_content_option_re.search(sql)
+    if match is None:
+        return None
+    if match.group("dquoted") is not None:
+        return match.group("dquoted").replace('""', '"')
+    if match.group("squoted") is not None:
+        return match.group("squoted").replace("''", "'")
+    if match.group("bracketed") is not None:
+        return match.group("bracketed")
+    return match.group("bare")
+
+
+def _parse_fts5_tokenize_option(sql: str) -> str | None:
+    "Return the raw ``tokenize=`` option text from an FTS5 CREATE statement."
+    match = _fts5_tokenize_option_re.search(sql)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _fts5_phrase(value: Any) -> str:
+    "Quote a value as an FTS5 phrase string for use in a MATCH expression."
+    return '"{}"'.format(str(value).replace('"', '""'))
+
+
+def _trigger_references_fts_table(sql: str, fts_table: str) -> bool:
+    "Does this trigger SQL appear to write to the specified FTS table?"
+    lowered = sql.lower()
+    if f"[{fts_table.lower()}]" in lowered or f'"{fts_table.lower()}"' in lowered:
+        return True
+    return (
+        re.search(
+            r"(?<![\w])" + re.escape(fts_table) + r"(?![\w])", sql, re.IGNORECASE
+        )
+        is not None
+    )
+
+
 class TransformError(Exception):
     pass
 
@@ -454,6 +539,10 @@ class BadPrimaryKey(Exception):
 
 class NotFoundError(Exception):
     "Record not found"
+
+
+class FtsRepairError(Exception):
+    "Full-text search index cannot be safely repaired automatically"
 
 
 class PrimaryKeyRequired(Exception):
@@ -3810,38 +3899,46 @@ class Table(Queryable):
         self.populate_fts(columns)
 
         if create_triggers:
-            old_cols = ", ".join(f"old.{quote_identifier(c)}" for c in columns)
-            new_cols = ", ".join(f"new.{quote_identifier(c)}" for c in columns)
-            columns_quoted = ", ".join(quote_identifier(c) for c in columns)
-            table = quote_identifier(self.name)
-            table_fts = quote_identifier(self.name + "_fts")
-            triggers = (
-                textwrap.dedent("""
-                CREATE TRIGGER {table_ai} AFTER INSERT ON {table} BEGIN
-                  INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
-                END;
-                CREATE TRIGGER {table_ad} AFTER DELETE ON {table} BEGIN
-                  INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
-                END;
-                CREATE TRIGGER {table_au} AFTER UPDATE ON {table} BEGIN
-                  INSERT INTO {table_fts} ({table_fts}, rowid, {columns}) VALUES('delete', old.rowid, {old_cols});
-                  INSERT INTO {table_fts} (rowid, {columns}) VALUES (new.rowid, {new_cols});
-                END;
-            """)
-                .strip()
-                .format(
-                    table=table,
-                    table_fts=table_fts,
-                    table_ai=quote_identifier(self.name + "_ai"),
-                    table_ad=quote_identifier(self.name + "_ad"),
-                    table_au=quote_identifier(self.name + "_au"),
-                    columns=columns_quoted,
-                    old_cols=old_cols,
-                    new_cols=new_cols,
+            self.db.executescript(
+                ";\n".join(
+                    self._fts_sync_triggers(self.name + "_fts", columns).values()
                 )
             )
-            self.db.executescript(triggers)
         return self
+
+    def _fts_sync_triggers(
+        self, fts_table: str, columns: Iterable[str]
+    ) -> dict[str, str]:
+        """
+        ``{trigger_name: sql}`` for the ``_ai``/``_ad``/``_au`` triggers used to
+        keep the specified FTS external content table in sync with this table.
+        """
+        old_cols = ", ".join(f"old.{quote_identifier(c)}" for c in columns)
+        new_cols = ", ".join(f"new.{quote_identifier(c)}" for c in columns)
+        columns_quoted = ", ".join(quote_identifier(c) for c in columns)
+        table = quote_identifier(self.name)
+        table_fts = quote_identifier(fts_table)
+        return {
+            self.name
+            + "_ai": (
+                f"CREATE TRIGGER {quote_identifier(self.name + '_ai')} AFTER INSERT ON {table} BEGIN\n"
+                f"  INSERT INTO {table_fts} (rowid, {columns_quoted}) VALUES (new.rowid, {new_cols});\n"
+                "END"
+            ),
+            self.name
+            + "_ad": (
+                f"CREATE TRIGGER {quote_identifier(self.name + '_ad')} AFTER DELETE ON {table} BEGIN\n"
+                f"  INSERT INTO {table_fts} ({table_fts}, rowid, {columns_quoted}) VALUES('delete', old.rowid, {old_cols});\n"
+                "END"
+            ),
+            self.name
+            + "_au": (
+                f"CREATE TRIGGER {quote_identifier(self.name + '_au')} AFTER UPDATE ON {table} BEGIN\n"
+                f"  INSERT INTO {table_fts} ({table_fts}, rowid, {columns_quoted}) VALUES('delete', old.rowid, {old_cols});\n"
+                f"  INSERT INTO {table_fts} (rowid, {columns_quoted}) VALUES (new.rowid, {new_cols});\n"
+                "END"
+            ),
+        }
 
     def populate_fts(self, columns: Iterable[str]) -> "Table":
         """
@@ -3900,6 +3997,224 @@ class Table(Queryable):
                 )
             )
         return self
+
+    def check_fts_health(self) -> FtsHealthReport:
+        """
+        Check the health of the FTS5 external content index for this table.
+
+        Returns an :class:`FtsHealthReport` distinguishing these problems:
+
+        - ``index_mismatch``: the FTS index does not match the table content
+        - ``missing_triggers``: expected synchronization triggers are absent
+        - ``mismatched_triggers``: triggers with the expected names exist but
+          have different definitions
+        - ``unsupported``: the FTS layout is not one this library can verify
+
+        Triggers are verified by comparing their full definitions, not just
+        their names. Raises :class:`NotFoundError` if this table has no
+        associated FTS table at all.
+        """
+        fts_table = self.detect_fts()
+        if fts_table is None:
+            raise NotFoundError(
+                f"Table [{self.name}] does not have an associated FTS table"
+            )
+        schema = self.db.execute(
+            "select sql from sqlite_master where name = ?", [fts_table]
+        ).fetchone()[0]
+        if not re.search(r"\busing\s+fts5\b", schema, re.IGNORECASE):
+            return FtsHealthReport(
+                table=self.name,
+                fts_table=fts_table,
+                columns=[],
+                unsupported=(
+                    f"[{fts_table}] is not an FTS5 table - only FTS5 external "
+                    "content tables are supported"
+                ),
+            )
+        content = _parse_fts5_content_option(schema)
+        if content is None:
+            return FtsHealthReport(
+                table=self.name,
+                fts_table=fts_table,
+                columns=[],
+                unsupported=(
+                    f"[{fts_table}] does not use an external content table - "
+                    "only FTS5 external content tables are supported"
+                ),
+            )
+        if content != self.name:
+            return FtsHealthReport(
+                table=self.name,
+                fts_table=fts_table,
+                columns=[],
+                unsupported=(
+                    f"[{fts_table}] indexes content table [{content}] which "
+                    f"does not match [{self.name}]"
+                ),
+            )
+        if re.search(r"\bwithout\s+rowid\b", self.schema, re.IGNORECASE):
+            return FtsHealthReport(
+                table=self.name,
+                fts_table=fts_table,
+                columns=[],
+                unsupported=(
+                    f"[{self.name}] is a WITHOUT ROWID table - FTS "
+                    "synchronization requires a rowid table"
+                ),
+            )
+        columns = [
+            row[1]
+            for row in self.db.execute(
+                f"PRAGMA table_xinfo({quote_identifier(fts_table)})"
+            )
+            if row[6] == 0
+        ]
+        report = FtsHealthReport(
+            table=self.name, fts_table=fts_table, columns=columns
+        )
+        docsize_table = f"{fts_table}_docsize"
+        if not self.db.execute(
+            "select 1 from sqlite_master where name = ?", [docsize_table]
+        ).fetchone():
+            report.unsupported = (
+                f"[{fts_table}] has no docsize shadow table - this layout "
+                "cannot be verified"
+            )
+            return report
+        report.index_mismatch = self._fts_index_mismatch(
+            fts_table, columns, _parse_fts5_tokenize_option(schema)
+        )
+        expected_triggers = self._fts_sync_triggers(fts_table, columns)
+        existing_triggers = self.triggers_dict
+        for name, sql in expected_triggers.items():
+            if name not in existing_triggers:
+                report.missing_triggers.append(name)
+            elif existing_triggers[name].strip() != sql.strip():
+                report.mismatched_triggers.append(name)
+        return report
+
+    def repair_fts(self) -> FtsHealthReport:
+        """
+        Repair the FTS5 external content index for this table.
+
+        In a single transaction, rebuilds the index from the table content and
+        recreates any missing or mismatched synchronization triggers identified
+        by :meth:`check_fts_health`. Triggers on this table that are not part
+        of the expected FTS synchronization set are left untouched, and a
+        healthy index is left completely unchanged.
+
+        Raises :class:`FtsRepairError` without modifying anything if the
+        layout is unsupported, or if a trigger with an expected name has a
+        custom definition that cannot be reliably identified as a broken
+        synchronization trigger.
+        """
+        report = self.check_fts_health()
+        if report.unsupported is not None:
+            raise FtsRepairError(report.unsupported)
+        if report.ok:
+            return report
+        existing_triggers = self.triggers_dict
+        for name in report.mismatched_triggers:
+            if not _trigger_references_fts_table(
+                existing_triggers[name], report.fts_table
+            ):
+                raise FtsRepairError(
+                    f"Trigger [{name}] on table [{self.name}] does not match "
+                    "the expected FTS synchronization trigger and does not "
+                    f"reference [{report.fts_table}] - refusing to replace a "
+                    "trigger this library did not create"
+                )
+        expected_triggers = self._fts_sync_triggers(report.fts_table, report.columns)
+        with self.db.atomic():
+            self.db.execute(
+                "INSERT INTO {fts}({fts}) VALUES('rebuild')".format(
+                    fts=quote_identifier(report.fts_table)
+                )
+            )
+            for name in report.missing_triggers + report.mismatched_triggers:
+                self.db.execute(f"DROP TRIGGER IF EXISTS {quote_identifier(name)}")
+                self.db.execute(expected_triggers[name])
+        return self.check_fts_health()
+
+    def _fts_index_mismatch(
+        self, fts_table: str, columns: list[str], tokenize: str | None
+    ) -> bool:
+        """
+        Compare an FTS5 external content index against the table content by
+        building a fresh index in a temporary table and using it to probe the
+        live index.
+        """
+        tmp = f"_sqlite_utils_fts_check_{secrets.token_hex(8)}"
+        columns_sql = ", ".join(quote_identifier(c) for c in columns)
+        tokenize_sql = f", tokenize={tokenize}" if tokenize else ""
+        try:
+            self.db.execute(
+                f"CREATE VIRTUAL TABLE temp.{quote_identifier(tmp)} "
+                f"USING FTS5 ({columns_sql}{tokenize_sql})"
+            )
+            self.db.execute(
+                f"INSERT INTO temp.{quote_identifier(tmp)} (rowid, {columns_sql}) "
+                f"SELECT rowid, {columns_sql} FROM {quote_identifier(self.name)}"
+            )
+            live_rows = self.db.execute(
+                f"SELECT rowid, sz FROM {quote_identifier(fts_table + '_docsize')} "
+                "ORDER BY rowid"
+            ).fetchall()
+            fresh_rows = self.db.execute(
+                f"SELECT rowid, sz FROM temp.{quote_identifier(tmp + '_docsize')} "
+                "ORDER BY rowid"
+            ).fetchall()
+            if [row[0] for row in live_rows] != [row[0] for row in fresh_rows]:
+                return True
+            if [bytes(row[1]) for row in live_rows] != [
+                bytes(row[1]) for row in fresh_rows
+            ]:
+                return True
+            # Token counts match - probe the live index with phrases built
+            # from the fresh index to verify the tokens themselves match
+            fresh_texts = self.db.execute(
+                f"SELECT rowid, {columns_sql} FROM temp.{quote_identifier(tmp)}"
+            ).fetchall()
+            for row in fresh_texts:
+                rowid, values = row[0], row[1:]
+                probes = [
+                    (column, _fts5_phrase(value))
+                    for column, value in zip(columns, values)
+                    if value is not None
+                ]
+                if not probes:
+                    continue
+                where = " AND ".join(
+                    f"{quote_identifier(column)} MATCH ?" for column, _ in probes
+                )
+                params = [phrase for _, phrase in probes]
+                if self.db.execute(
+                    f"SELECT 1 FROM {quote_identifier(fts_table)} "
+                    f"WHERE rowid = ? AND {where}",
+                    [rowid] + params,
+                ).fetchone():
+                    continue
+                # A combined probe can fail on values that tokenize to nothing
+                # (for example punctuation-only strings) - probe each column
+                # against both indexes to tell staleness apart from that
+                for column, phrase in probes:
+                    if self.db.execute(
+                        f"SELECT 1 FROM {quote_identifier(fts_table)} "
+                        f"WHERE rowid = ? AND {quote_identifier(column)} MATCH ?",
+                        [rowid, phrase],
+                    ).fetchone():
+                        continue
+                    if self.db.execute(
+                        f"SELECT 1 FROM temp.{quote_identifier(tmp)} "
+                        f"WHERE rowid = ? AND {quote_identifier(column)} MATCH ?",
+                        [rowid, phrase],
+                    ).fetchone():
+                        return True
+                    # Value produced no tokens - the docsize check covers it
+            return False
+        finally:
+            self.db.execute(f"DROP TABLE IF EXISTS temp.{quote_identifier(tmp)}")
 
     def detect_fts(self) -> str | None:
         "Detect if table has a corresponding FTS virtual table and return it"
