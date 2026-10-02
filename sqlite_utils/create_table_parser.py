@@ -50,6 +50,34 @@ class Unique:
     end: int = field(default=-1, compare=False, repr=False)
 
 
+@dataclass(frozen=True)
+class GeneratedColumn:
+    name: str
+    expression: str
+    mode: str
+    before_expression: str
+    suffix: str
+
+    def definition(
+        self,
+        name: str | None = None,
+        expression: str | None = None,
+        mode: str | None = None,
+        suffix: str | None = None,
+    ) -> str:
+        column_name = '"{}"'.format(
+            (name if name is not None else self.name).replace('"', '""')
+        )
+        parts = [
+            column_name,
+            self.before_expression,
+            f"AS ({expression if expression is not None else self.expression})",
+            mode or self.mode,
+            self.suffix if suffix is None else suffix,
+        ]
+        return " ".join(part for part in parts if part)
+
+
 class ParseError(ValueError):
     pass
 
@@ -814,6 +842,129 @@ def parse_column_comments(create_sql: str) -> dict[str, ColumnComments]:
     return comments
 
 
+def parse_generated_columns(create_sql: str) -> dict[str, GeneratedColumn]:
+    """Return generated column definitions from a CREATE TABLE statement."""
+    body_info = _table_body(create_sql)
+    if body_info is None:
+        return {}
+    body, _ = body_info
+    generated: dict[str, GeneratedColumn] = {}
+    for item, _, _ in _split_spans(body, _lex(body)):
+        tokens = _meaningful(_lex(item))
+        if not tokens or tokens[0].is_keyword("CONSTRAINT"):
+            continue
+        head = tokens[0]
+        if head.kind not in ("word", "identifier"):
+            continue
+        column = _unquote(head.text)
+        generated_index = None
+        depth = 0
+        for index, token in enumerate(tokens[1:], start=1):
+            if token.text == "(":
+                depth += 1
+            elif token.text == ")":
+                depth = max(0, depth - 1)
+            elif depth == 0 and token.is_keyword("AS"):
+                generated_index = index
+                break
+        if generated_index is None:
+            continue
+        open_index = generated_index + 1
+        if open_index >= len(tokens) or tokens[open_index].text != "(":
+            raise ParseError("Generated column AS must be followed by an expression")
+        close_index = _matching_paren(tokens, open_index)
+        expression = item[tokens[open_index].end : tokens[close_index].start].strip()
+        before_expression = item[
+            tokens[1].start : tokens[generated_index].start
+        ].strip()
+        suffix_start = (
+            tokens[close_index + 1].start
+            if close_index + 1 < len(tokens)
+            else len(item)
+        )
+        suffix = item[suffix_start:].strip()
+        suffix_tokens = _meaningful(_lex(suffix))
+        mode = "VIRTUAL"
+        suffix_after_mode = 0
+        if suffix_tokens and suffix_tokens[0].is_keyword("STORED"):
+            mode = "STORED"
+            suffix_after_mode = suffix_tokens[0].end
+        elif suffix_tokens and suffix_tokens[0].is_keyword("VIRTUAL"):
+            suffix_after_mode = suffix_tokens[0].end
+        if suffix_after_mode:
+            suffix = suffix[suffix_after_mode:].strip()
+        suffix_meaningful = _meaningful(_lex(suffix))
+        if not suffix_meaningful:
+            suffix = ""
+        else:
+            suffix = suffix[: suffix_meaningful[-1].end].strip()
+        generated[column] = GeneratedColumn(
+            name=column,
+            expression=expression,
+            mode=mode,
+            before_expression=before_expression,
+            suffix=suffix,
+        )
+    return generated
+
+
+def parse_table_options(create_sql: str) -> str:
+    """Return normalized STRICT and WITHOUT ROWID options from CREATE TABLE."""
+    all_tokens = _lex(create_sql)
+    tokens = _meaningful(all_tokens)
+    if not tokens or not tokens[0].is_keyword("CREATE"):
+        raise ParseError("Expected CREATE TABLE")
+    index = 1
+    if index < len(tokens) and (
+        tokens[index].is_keyword("TEMP") or tokens[index].is_keyword("TEMPORARY")
+    ):
+        index += 1
+    if index < len(tokens) and tokens[index].is_keyword("VIRTUAL"):
+        return ""
+    if index >= len(tokens) or not tokens[index].is_keyword("TABLE"):
+        raise ParseError("Expected CREATE TABLE")
+    index += 1
+    if (
+        index + 2 < len(tokens)
+        and tokens[index].is_keyword("IF")
+        and tokens[index + 1].is_keyword("NOT")
+        and tokens[index + 2].is_keyword("EXISTS")
+    ):
+        index += 3
+    if index >= len(tokens):
+        raise ParseError("CREATE TABLE is missing its table name")
+    index += 1
+    if index + 1 < len(tokens) and tokens[index].text == ".":
+        index += 2
+    if index < len(tokens) and tokens[index].is_keyword("AS"):
+        return ""
+    if index >= len(tokens) or tokens[index].text != "(":
+        raise ParseError("CREATE TABLE is missing its column list")
+    index = _matching_paren(tokens, index) + 1
+    options = []
+    while index < len(tokens):
+        if tokens[index].text == ",":
+            index += 1
+            continue
+        if tokens[index].is_keyword("STRICT"):
+            options.append("STRICT")
+            index += 1
+            continue
+        if tokens[index].is_keyword("WITHOUT"):
+            if (
+                index + 1 >= len(tokens)
+                or not tokens[index + 1].is_keyword("ROWID")
+            ):
+                raise ParseError("Invalid WITHOUT ROWID table option")
+            options.append("WITHOUT ROWID")
+            index += 2
+            continue
+        if tokens[index].text == ";":
+            break
+        raise ParseError("Unexpected table option")
+    return ", ".join(options)
+
+
 def _is_identifier_token(tokens: list[_Token], index: int) -> bool:
     token = tokens[index]
     if index + 1 < len(tokens) and tokens[index + 1].text in ("(", "."):
@@ -824,7 +975,7 @@ def _is_identifier_token(tokens: list[_Token], index: int) -> bool:
         return False
     if token.kind == "identifier":
         return True
-    if token.kind != "word" or token.text.upper() in _SQLITE_KEYWORDS:
+    if token.kind != "word":
         return False
     return True
 
@@ -876,8 +1027,8 @@ def _quote_replacement(original: str, replacement: str) -> str:
     return '"{}"'.format(replacement.replace('"', '""'))
 
 
-def rewrite_check_expression(expression: str, rename: dict[str, str]) -> str:
-    """Rewrite column identifiers in a CHECK expression, preserving trivia."""
+def rewrite_identifiers_in_expression(expression: str, rename: dict[str, str]) -> str:
+    """Rewrite column identifiers in an expression, preserving trivia."""
     if not rename:
         return expression
     tokens = _lex(expression)
@@ -895,3 +1046,122 @@ def rewrite_check_expression(expression: str, rename: dict[str, str]) -> str:
     for start, end, replacement in reversed(edits):
         expression = expression[:start] + replacement + expression[end:]
     return expression
+
+
+def rewrite_check_expression(expression: str, rename: dict[str, str]) -> str:
+    """Rewrite column identifiers in a CHECK expression, preserving trivia."""
+    return rewrite_identifiers_in_expression(expression, rename)
+
+
+def rewrite_generated_column_suffix(suffix: str, rename: dict[str, str]) -> str:
+    if not rename:
+        return suffix
+    tokens = _lex(suffix)
+    meaningful = _meaningful(tokens)
+    edits: list[tuple[int, int, str]] = []
+    depth = 0
+    index = 0
+    while index < len(meaningful):
+        token = meaningful[index]
+        if token.text == "(":
+            depth += 1
+        elif token.text == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and token.is_keyword("CHECK"):
+            if index + 1 >= len(meaningful) or meaningful[index + 1].text != "(":
+                raise ParseError("CHECK must be followed by a parenthesized expression")
+            close = _matching_paren(meaningful, index + 1)
+            start = meaningful[index + 1].end
+            end = meaningful[close].start
+            edits.append(
+                (
+                    start,
+                    end,
+                    rewrite_identifiers_in_expression(suffix[start:end], rename),
+                )
+            )
+            index = close
+        index += 1
+    for start, end, replacement in reversed(edits):
+        suffix = suffix[:start] + replacement + suffix[end:]
+    return suffix
+
+
+def _index_target_tokens(tokens: list[_Token]) -> tuple[int, int, int, int]:
+    index = 0
+    if tokens[index].is_keyword("CREATE"):
+        index += 1
+    if index < len(tokens) and tokens[index].is_keyword("UNIQUE"):
+        index += 1
+    if index >= len(tokens) or not tokens[index].is_keyword("INDEX"):
+        raise ParseError("Expected CREATE INDEX")
+    index += 1
+    if index < len(tokens) and tokens[index].is_keyword("IF"):
+        if (
+            index + 2 >= len(tokens)
+            or not tokens[index + 1].is_keyword("NOT")
+            or not tokens[index + 2].is_keyword("EXISTS")
+        ):
+            raise ParseError("Invalid IF NOT EXISTS in CREATE INDEX")
+        index += 3
+    while index < len(tokens) and not tokens[index].is_keyword("ON"):
+        index += 1
+    if index >= len(tokens):
+        raise ParseError("CREATE INDEX is missing ON")
+    index += 1
+    if index < len(tokens) and tokens[index].kind in ("word", "identifier"):
+        index += 1
+        if index < len(tokens) and tokens[index].text == ".":
+            if index + 1 >= len(tokens):
+                raise ParseError("Qualified index table is incomplete")
+            index += 2
+    if index >= len(tokens) or tokens[index].text != "(":
+        raise ParseError("CREATE INDEX is missing its column list")
+    close = _matching_paren(tokens, index)
+    return index, close, close + 1, len(tokens)
+
+
+def rewrite_index_sql(index_sql: str, rename: dict[str, str]) -> str:
+    """Rewrite table-column references in a CREATE INDEX statement."""
+    if not rename:
+        return index_sql
+    tokens = _lex(index_sql)
+    meaningful = _meaningful(tokens)
+    open_index, close_index, after_index, end_index = _index_target_tokens(meaningful)
+    spans = [
+        (meaningful[open_index].end, meaningful[close_index].start),
+    ]
+    index = after_index
+    while index < end_index:
+        if meaningful[index].is_keyword("WHERE") and index + 1 < end_index:
+            spans.append((meaningful[index + 1].start, meaningful[end_index - 1].end))
+            break
+        index += 1
+    result = []
+    cursor = 0
+    for start, end in spans:
+        result.append(index_sql[cursor:start])
+        result.append(rewrite_identifiers_in_expression(index_sql[start:end], rename))
+        cursor = end
+    result.append(index_sql[cursor:])
+    return "".join(result)
+
+
+def index_references_identifier(index_sql: str, identifier: str) -> bool:
+    """Return True if an index expression or predicate references a column."""
+    tokens = _lex(index_sql)
+    meaningful = _meaningful(tokens)
+    open_index, close_index, after_index, end_index = _index_target_tokens(meaningful)
+    start = meaningful[open_index].end
+    end = meaningful[close_index].start
+    if check_references_identifier(index_sql[start:end], identifier):
+        return True
+    index = after_index
+    while index < end_index:
+        if meaningful[index].is_keyword("WHERE") and index + 1 < end_index:
+            return check_references_identifier(
+                index_sql[meaningful[index + 1].start : meaningful[end_index - 1].end],
+                identifier,
+            )
+        index += 1
+    return False

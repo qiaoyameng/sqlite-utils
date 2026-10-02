@@ -1015,16 +1015,27 @@ def test_transform_recreates_renamed_index_from_metadata(fresh_db):
         "CREATE INDEX idx_t_name ON t(name) WHERE name IS NOT NULL",
     ),
 )
-def test_transform_rename_complex_index_errors(fresh_db, index_sql):
+def test_transform_rewrites_complex_indexes(fresh_db, index_sql):
     table = fresh_db.table("t")
     table.insert({"id": 1, "name": "Cleo"}, pk="id")
     fresh_db.execute(index_sql)
 
-    with pytest.raises(TransformError, match="partial or expression index"):
-        table.transform(rename={"name": "full_name"})
+    table.transform(rename={"name": "full_name"})
 
-    assert table.columns_dict == {"id": int, "name": str}
+    assert table.columns_dict == {"id": int, "full_name": str}
     assert [index.name for index in table.indexes] == ["idx_t_name"]
+    rewritten_sql = fresh_db.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'idx_t_name'"
+    ).fetchone()[0]
+    if "lower(" in index_sql:
+        assert "lower(full_name)" in rewritten_sql
+        query = "SELECT id FROM t WHERE lower(full_name) = ?"
+        parameters = ("cleo",)
+    else:
+        assert "full_name IS NOT NULL" in rewritten_sql
+        query = "SELECT id FROM t WHERE full_name IS NOT NULL"
+        parameters = ()
+    assert fresh_db.execute(query, parameters).fetchall() == [(1,)]
 
 
 def test_transform_with_unique_constraint_implicit_index(fresh_db):
@@ -1472,3 +1483,263 @@ def test_transform_refuses_to_drop_column_used_by_remaining_check(fresh_db):
     ):
         ranges.transform(drop={"maximum"})
     assert ranges.schema == schema_before
+
+
+@pytest.mark.skipif(
+    sqlite3.sqlite_version_info < (3, 31, 0),
+    reason="Generated columns require SQLite 3.31.0 or higher",
+)
+def test_transform_preserves_generated_columns_and_expression_index(fresh_db):
+    fresh_db.execute("CREATE TABLE lookup (id INTEGER PRIMARY KEY)")
+    fresh_db.execute("INSERT INTO lookup (id) VALUES (7)")
+    fresh_db.execute(
+        """
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY,
+            "base value" INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            upper_label TEXT GENERATED ALWAYS AS (upper(label)) VIRTUAL UNIQUE
+                CHECK(upper_label = upper(label)),
+            doubled INTEGER AS ("base value" * 2) STORED,
+            chained TEXT AS (upper_label || '-' || doubled),
+            fk_value INTEGER AS ("base value") STORED REFERENCES lookup(id)
+        )
+        """
+    )
+    fresh_db.execute("CREATE UNIQUE INDEX idx_generated ON items (doubled, chained)")
+    fresh_db.execute(
+        """
+        CREATE INDEX idx_expressions ON items (
+            ("base value" + doubled),
+            lower(label)
+        ) WHERE chained IS NOT NULL
+        """
+    )
+    fresh_db.execute(
+        "INSERT INTO items (id, \"base value\", label) VALUES (1, 3, 'abc')"
+    )
+
+    fresh_db.table("items").transform(
+        rename={
+            "base value": "renamed value",
+            "label": "renamed label",
+            "upper_label": "upper renamed",
+        }
+    )
+
+    schema = fresh_db.table("items").schema
+    assert "VIRTUAL" in schema
+    assert "STORED" in schema
+    assert 'AS (upper("renamed label"))' in schema
+    assert 'AS ("renamed value" * 2)' in schema
+    assert 'AS ("upper renamed" || \'-\' || doubled)' in schema
+    assert "UNIQUE" in schema
+    assert 'CHECK("upper renamed" = upper("renamed label"))' in schema
+    assert "REFERENCES lookup(id)" in schema
+    columns = [
+        row[1] for row in fresh_db.execute("PRAGMA table_xinfo(items)")
+    ]
+    assert columns == [
+        "id",
+        "renamed value",
+        "renamed label",
+        "upper renamed",
+        "doubled",
+        "chained",
+        "fk_value",
+    ]
+    assert [
+        foreign_key.columns for foreign_key in fresh_db.table("items").foreign_keys
+    ] == [("fk_value",)]
+    index_sql = fresh_db.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'idx_expressions'"
+    ).fetchone()[0]
+    assert '("renamed value" + doubled)' in index_sql
+    assert 'lower("renamed label")' in index_sql
+    assert "chained IS NOT NULL" in index_sql
+
+    fresh_db.execute(
+        "INSERT INTO items (id, \"renamed value\", \"renamed label\") "
+        "VALUES (2, 4, 'def')"
+    )
+    fresh_db.execute('UPDATE items SET "renamed value" = 10 WHERE id = 1')
+    selected_columns = (
+        '"renamed value", "renamed label", "upper renamed", doubled, chained'
+    )
+    assert list(
+        fresh_db.execute(f"SELECT {selected_columns} FROM items ORDER BY id")
+    ) == [
+        (10, "abc", "ABC", 20, "ABC-20"),
+        (4, "def", "DEF", 8, "DEF-8"),
+    ]
+    assert fresh_db.execute(
+        'SELECT id FROM items WHERE ("renamed value" + doubled) = ? '
+        'AND lower("renamed label") = ?',
+        (30, "abc"),
+    ).fetchall() == [(1,)]
+    assert fresh_db.execute(
+        'SELECT id FROM items WHERE ("renamed value" + doubled) = ? '
+        'AND lower("renamed label") = ?',
+        (12, "def"),
+    ).fetchall() == [(2,)]
+    assert fresh_db.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_generated'"
+    ).fetchall() == [("idx_generated",)]
+
+
+@pytest.mark.skipif(
+    sqlite3.sqlite_version_info < (3, 31, 0),
+    reason="Generated columns require SQLite 3.31.0 or higher",
+)
+def test_transform_rename_generated_column_only_rewrites_real_references(fresh_db):
+    fresh_db.execute(
+        """
+        CREATE TABLE items (
+            label TEXT,
+            amount INTEGER,
+            calculated INTEGER AS (
+                amount + length(label)
+                + length('amount')
+                + length('calculated')
+            )
+        )
+        """
+    )
+    fresh_db.table("items").transform(
+        rename={"amount": "total", "calculated": "result"}
+    )
+    schema = fresh_db.table("items").schema
+    assert 'AS (' in schema
+    assert 'total + length(label)' in schema
+    assert "length('amount')" in schema
+    assert "length('calculated')" in schema
+    assert '"result" INTEGER' in schema
+
+
+@pytest.mark.skipif(
+    sqlite3.sqlite_version_info < (3, 31, 0),
+    reason="Generated columns require SQLite 3.31.0 or higher",
+)
+def test_transform_rejects_drop_with_generated_column_dependency_chain(fresh_db):
+    fresh_db.execute(
+        """
+        CREATE TABLE items (
+            base INTEGER,
+            first INTEGER AS (base + 1) STORED,
+            second INTEGER AS (first * 2) VIRTUAL
+        )
+        """
+    )
+    fresh_db.execute("INSERT INTO items (base) VALUES (3)")
+    table = fresh_db.table("items")
+    schema_before = table.schema
+    rows_before = fresh_db.execute("SELECT * FROM items").fetchall()
+    master_before = fresh_db.execute(
+        "SELECT name, type, sql FROM sqlite_master ORDER BY name"
+    ).fetchall()
+
+    with pytest.raises(
+        TransformError,
+        match="Cannot drop column 'base'.*'base' -> 'first' -> 'second'",
+    ):
+        table.transform(drop={"base"})
+    with pytest.raises(
+        TransformError,
+        match="Cannot drop column 'first'.*'first' -> 'second'",
+    ):
+        table.transform(drop={"first"})
+
+    assert table.schema == schema_before
+    assert fresh_db.execute("SELECT * FROM items").fetchall() == rows_before
+    assert (
+        fresh_db.execute(
+            "SELECT name, type, sql FROM sqlite_master ORDER BY name"
+        ).fetchall()
+        == master_before
+    )
+
+    table.transform(drop={"first", "second"})
+    assert list(table.columns_dict) == ["base"]
+
+
+@pytest.mark.skipif(
+    sqlite3.sqlite_version_info < (3, 31, 0),
+    reason="Generated columns require SQLite 3.31.0 or higher",
+)
+def test_transform_failure_while_copying_generated_table_rolls_back(fresh_db):
+    fresh_db.execute(
+        """
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY,
+            base INTEGER NOT NULL,
+            generated INTEGER AS (base * 2) STORED
+        )
+        """
+    )
+    fresh_db.execute("INSERT INTO items (id, base) VALUES (1, 3)")
+    table = fresh_db.table("items")
+    schema_before = table.schema
+    rows_before = fresh_db.execute("SELECT * FROM items").fetchall()
+    master_before = fresh_db.execute(
+        "SELECT name, type, sql FROM sqlite_master ORDER BY name"
+    ).fetchall()
+    sqls = table.transform_sql(
+        rename={"base": "renamed"}, tmp_suffix="rollback_failure"
+    )
+    temporary_name = "items_new_rollback_failure"
+    copy_index = next(
+        index for index, sql in enumerate(sqls) if sql.startswith("INSERT")
+    )
+    fresh_db.conn.execute("BEGIN")
+    try:
+        for index, sql in enumerate(sqls):
+            if index == copy_index:
+                fresh_db.conn.execute(
+                    f"""
+                    CREATE TRIGGER fail_copy BEFORE INSERT ON "{temporary_name}"
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced copy failure');
+                    END
+                    """
+                )
+            fresh_db.conn.execute(sql)
+    except sqlite3.Error as ex:
+        assert "forced copy failure" in str(ex)
+        fresh_db.conn.execute("ROLLBACK")
+    else:
+        fresh_db.conn.execute("ROLLBACK")
+        raise AssertionError("Expected copy to fail")
+    assert table.schema == schema_before
+    assert fresh_db.execute("SELECT * FROM items").fetchall() == rows_before
+    assert (
+        fresh_db.execute(
+            "SELECT name, type, sql FROM sqlite_master ORDER BY name"
+        ).fetchall()
+        == master_before
+    )
+    assert fresh_db.execute(
+        "SELECT name FROM sqlite_master WHERE name = ?", (temporary_name,)
+    ).fetchall() == []
+
+
+@pytest.mark.skipif(
+    sqlite3.sqlite_version_info < (3, 31, 0),
+    reason="Generated columns require SQLite 3.31.0 or higher",
+)
+def test_transform_generated_columns_without_rowid_table(fresh_db):
+    fresh_db.execute(
+        """
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY,
+            doubled INTEGER AS (id * 2) STORED
+        ) WITHOUT ROWID
+        """
+    )
+    fresh_db.execute("INSERT INTO items (id) VALUES (3)")
+
+    fresh_db.table("items").transform(rename={"id": "identifier"})
+
+    assert "WITHOUT ROWID" in fresh_db.table("items").schema
+    assert fresh_db.execute("SELECT * FROM items").fetchall() == [(3, 6)]
+    fresh_db.execute("INSERT INTO items (identifier) VALUES (4)")
+    assert fresh_db.execute("SELECT * FROM items").fetchall() == [(3, 6), (4, 8)]

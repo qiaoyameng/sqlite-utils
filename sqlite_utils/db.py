@@ -29,15 +29,22 @@ from sqlite_utils.plugins import ensure_plugins_loaded, pm
 from .create_table_parser import (
     Check,
     ColumnComments,
+    GeneratedColumn,
     ParseError,
     Unique,
     UniqueColumn,
     check_references_identifier,
+    index_references_identifier,
     parse_autoincrement,
     parse_checks,
     parse_column_comments,
+    parse_generated_columns,
+    parse_table_options,
     parse_uniques,
     rewrite_check_expression,
+    rewrite_generated_column_suffix,
+    rewrite_identifiers_in_expression,
+    rewrite_index_sql,
     sql_ends_in_line_comment,
 )
 from .utils import (
@@ -324,6 +331,37 @@ Trigger = namedtuple("Trigger", ("name", "table", "sql"))
 
 class TransformError(Exception):
     pass
+
+
+def _generated_dependency_chain(
+    dropped_columns: Iterable[str], generated_columns: dict[str, GeneratedColumn]
+) -> list[str] | None:
+    def references(column_name: str, generated: GeneratedColumn) -> bool:
+        return check_references_identifier(generated.expression, column_name)
+
+    for dropped in sorted(dropped_columns):
+        queue = [dropped]
+        parents = {dropped: None}
+        deepest_chain = None
+        while queue:
+            current = queue.pop(0)
+            if current in generated_columns and current not in dropped_columns:
+                chain = [current]
+                parent = parents[current]
+                while parent is not None:
+                    chain.append(parent)
+                    parent = parents[parent]
+                chain.reverse()
+                if deepest_chain is None or len(chain) > len(deepest_chain):
+                    deepest_chain = chain
+            for generated_name, generated in generated_columns.items():
+                if generated_name in parents or not references(current, generated):
+                    continue
+                parents[generated_name] = current
+                queue.append(generated_name)
+        if deepest_chain is not None:
+            return deepest_chain
+    return None
 
 
 # A single column name, or a tuple of columns for a compound foreign key
@@ -1444,6 +1482,8 @@ class Database:
         _column_comments: Mapping[str, ColumnComments] | None = None,
         _autoincrement: str | None = None,
         _uniques: Iterable[Unique] | None = None,
+        _column_definitions: Mapping[str, str] | None = None,
+        _table_options: str | None = None,
     ) -> str:
         """
         Returns the SQL ``CREATE TABLE`` statement for creating the specified table.
@@ -1492,6 +1532,10 @@ class Database:
         column_comments = {
             resolve_casing(name, columns): comments
             for name, comments in (_column_comments or {}).items()
+        }
+        raw_column_definitions = {
+            resolve_casing(name, columns): definition
+            for name, definition in (_column_definitions or {}).items()
         }
         checks = list(_checks or ())
         checks_by_column: dict[str, list[Check]] = {}
@@ -1608,6 +1652,14 @@ class Database:
             if _autoincrement != single_pk:
                 raise ValueError("AUTOINCREMENT requires a single-column primary key")
         for column_name, column_type in column_items:
+            if column_name in raw_column_definitions:
+                column_definition = f"   {raw_column_definitions[column_name]}"
+                column_defs.append(
+                    _column_definition_with_comments(
+                        column_definition, column_comments.get(column_name)
+                    )
+                )
+                continue
             column_extras = []
             if column_name == single_pk:
                 column_extras.append("PRIMARY KEY")
@@ -1685,15 +1737,22 @@ class Database:
             f"   {_check_constraint_sql(check)}" for check in table_checks
         )
         columns_sql = ",\n".join(column_defs)
+        table_options = _table_options
+        if table_options is None:
+            table_options = "STRICT" if strict and self.supports_strict else ""
+        if table_options:
+            table_suffix = f" {table_options}"
+        else:
+            table_suffix = ""
         sql = """CREATE TABLE {if_not_exists}{table} (
 {columns_sql}{extra_pk}
-){strict};
+){table_suffix};
         """.format(
             if_not_exists="IF NOT EXISTS " if if_not_exists else "",
             table=quote_identifier(name),
             columns_sql=columns_sql,
             extra_pk=extra_pk,
-            strict=" STRICT" if strict and self.supports_strict else "",
+            table_suffix=table_suffix,
         )
         return sql
 
@@ -2236,6 +2295,22 @@ class Queryable:
             f"PRAGMA table_info({quote_identifier(self.name)})"
         ).fetchall()
         return [Column(*row) for row in rows]
+
+    @property
+    def table_xinfo(self) -> list[tuple]:
+        "Rows from ``PRAGMA table_xinfo``, including generated columns."
+        if not self.exists():
+            return []
+        if self.db.sqlite_version < (3, 26, 0):
+            return [
+                (*row, 0)
+                for row in self.db.execute(
+                    f"PRAGMA table_info({quote_identifier(self.name)})"
+                ).fetchall()
+            ]
+        return self.db.execute(
+            f"PRAGMA table_xinfo({quote_identifier(self.name)})"
+        ).fetchall()
 
     @property
     def columns_dict(self) -> dict[str, Any]:
@@ -2817,10 +2892,18 @@ class Table(Queryable):
 
         # Resolve column references against the existing schema, matching
         # case-insensitively the way SQLite does
-        existing_columns = self.columns_dict
+        existing_columns = {
+            column.name: column_affinity(column.type) for column in self.columns
+        }
+        existing_all_column_rows = self.table_xinfo
+        existing_all_columns = {
+            row[1]: column_affinity(row[2]) for row in existing_all_column_rows
+        }
         types = {resolve_casing(c, existing_columns): t for c, t in types.items()}
-        rename = {resolve_casing(c, existing_columns): v for c, v in rename.items()}
-        drop = {resolve_casing(c, existing_columns) for c in drop}
+        rename = {
+            resolve_casing(c, existing_all_columns): v for c, v in rename.items()
+        }
+        drop = {resolve_casing(c, existing_all_columns) for c in drop}
         if pk is not DEFAULT and pk is not None:
             if isinstance(pk, str):
                 pk = resolve_casing(pk, existing_columns)
@@ -2845,37 +2928,83 @@ class Table(Queryable):
             existing_column_comments = parse_column_comments(self.schema)
             existing_autoincrement = parse_autoincrement(self.schema)
             existing_uniques = parse_uniques(self.schema)
+            existing_generated_columns = parse_generated_columns(self.schema)
+            existing_table_options = parse_table_options(self.schema)
         except ParseError as ex:
             raise TransformError(
                 f"Could not parse table schema for table {self.name!r}: {ex}"
             ) from ex
+        generated_modes = {
+            row[1]: "STORED" if row[6] == 3 else "VIRTUAL"
+            for row in existing_all_column_rows
+            if row[6] in (2, 3)
+        }
+        for name, mode in generated_modes.items():
+            if name in existing_generated_columns:
+                generated = existing_generated_columns[name]
+                existing_generated_columns[name] = GeneratedColumn(
+                    generated.name,
+                    generated.expression,
+                    mode,
+                    generated.before_expression,
+                    generated.suffix,
+                )
+        dependency_chain = _generated_dependency_chain(drop, existing_generated_columns)
+        if dependency_chain is not None:
+            chain = " -> ".join(repr(column) for column in dependency_chain)
+            raise TransformError(
+                f"Cannot drop column {dependency_chain[0]!r}: it is used by "
+                f"generated column dependency chain {chain}. Drop the generated "
+                "columns as well, or keep the columns they depend on."
+            )
+        if strict is None:
+            create_table_options = existing_table_options
+        else:
+            create_table_options = (
+                "WITHOUT ROWID"
+                if "WITHOUT ROWID" in existing_table_options
+                else ""
+            )
+            if strict:
+                create_table_options = (
+                    f"{create_table_options}, STRICT"
+                    if create_table_options
+                    else "STRICT"
+                )
         create_table_checks: list[Check] = []
         for check in existing_checks:
             owner = (
-                resolve_casing(check.column, existing_columns) if check.column else ""
+                resolve_casing(check.column, existing_all_columns)
+                if check.column
+                else ""
             )
+            if owner in existing_generated_columns:
+                continue
             # A column-level constraint disappears with the column that owns it.
             if owner and owner in drop:
                 continue
             for dropped_column in drop:
                 if check_references_identifier(check.check, dropped_column):
+                    if dropped_column in existing_generated_columns:
+                        break
                     raise TransformError(
                         f"Cannot drop column {dropped_column!r}: it is used by "
                         f"CHECK constraint {check.name or check.check!r}"
                     )
-            create_table_checks.append(
-                Check(
-                    rewrite_check_expression(check.check, rename),
-                    name=check.name,
-                    column=rename.get(owner) or owner,
+            else:
+                create_table_checks.append(
+                    Check(
+                        rewrite_check_expression(check.check, rename),
+                        name=check.name,
+                        column=rename.get(owner) or owner,
+                    )
                 )
-            )
 
         create_table_uniques: list[Unique] = []
         for unique in existing_uniques:
             columns = tuple(
                 UniqueColumn(
-                    resolve_casing(column.name, existing_columns),
+                    resolve_casing(column.name, existing_all_columns),
                     collation=column.collation,
                     order=column.order,
                 )
@@ -2884,8 +3013,12 @@ class Table(Queryable):
             if any(column.name in drop for column in columns):
                 continue
             owner = (
-                resolve_casing(unique.column, existing_columns) if unique.column else ""
+                resolve_casing(unique.column, existing_all_columns)
+                if unique.column
+                else ""
             )
+            if owner in existing_generated_columns:
+                continue
             create_table_uniques.append(
                 Unique(
                     tuple(
@@ -2904,7 +3037,7 @@ class Table(Queryable):
 
         create_table_column_comments: dict[str, ColumnComments] = {}
         for column, comments in existing_column_comments.items():
-            owner = resolve_casing(column, existing_columns)
+            owner = resolve_casing(column, existing_all_columns)
             if owner not in drop:
                 create_table_column_comments[rename.get(owner) or owner] = comments
 
@@ -2979,22 +3112,45 @@ class Table(Queryable):
             # Copy over old foreign keys, unless we are dropping them
             for fk in self.foreign_keys:
                 if not fk_should_be_dropped(fk):
-                    create_table_foreign_keys.append(fk_with_renamed_columns(fk))
+                    renamed_fk = fk_with_renamed_columns(fk)
+                    if any(
+                        column in existing_generated_columns for column in fk.columns
+                    ):
+                        continue
+                    create_table_foreign_keys.append(renamed_fk)
             # Add new foreign keys
             if add_foreign_keys is not None:
                 for fk in self.db.resolve_foreign_keys(self.name, add_foreign_keys):
                     create_table_foreign_keys.append(fk_with_renamed_columns(fk))
 
         new_table_name = f"{self.name}_new_{tmp_suffix or os.urandom(6).hex()}"
-        current_column_pairs = list(self.columns_dict.items())
+        current_column_pairs = list(existing_all_columns.items())
         new_column_pairs = []
-        copy_from_to = {column: column for column, _ in current_column_pairs}
+        copy_from_to = {
+            column: column
+            for column, _ in current_column_pairs
+            if column not in existing_generated_columns and column not in drop
+        }
+        create_table_generated_columns = {}
         for name, type_ in current_column_pairs:
-            type_ = types.get(name) or type_
             if name in drop:
-                del copy_from_to[name]
                 continue
             new_name = rename.get(name) or name
+            generated = existing_generated_columns.get(name)
+            if generated is not None:
+                create_table_generated_columns[new_name] = generated.definition(
+                    name=new_name,
+                    expression=rewrite_identifiers_in_expression(
+                        generated.expression, rename
+                    ),
+                    mode=generated.mode,
+                    suffix=rewrite_generated_column_suffix(
+                        generated.suffix, rename
+                    ),
+                )
+                new_column_pairs.append((new_name, type_))
+                continue
+            type_ = types.get(name) or type_
             new_column_pairs.append((new_name, type_))
             copy_from_to[name] = new_name
 
@@ -3047,12 +3203,18 @@ class Table(Queryable):
             for key, value in not_null.items():
                 # Column may have been renamed
                 key = rename.get(key) or key
+                if key in create_table_generated_columns:
+                    continue
                 if value is False and key in create_table_not_null:
                     create_table_not_null.remove(key)
                 else:
                     create_table_not_null.add(key)
         elif isinstance(not_null, set):
-            create_table_not_null.update((rename.get(k) or k) for k in not_null)
+            create_table_not_null.update(
+                (rename.get(k) or k)
+                for k in not_null
+                if k not in existing_generated_columns
+            )
         elif not not_null:
             pass
         else:
@@ -3067,7 +3229,11 @@ class Table(Queryable):
         }
         if defaults is not None:
             create_table_defaults.update(
-                {rename.get(c) or c: v for c, v in defaults.items()}
+                {
+                    rename.get(c) or c: v
+                    for c, v in defaults.items()
+                    if c not in existing_generated_columns
+                }
             )
 
         if column_order is not None:
@@ -3088,6 +3254,8 @@ class Table(Queryable):
                 _column_comments=create_table_column_comments,
                 _autoincrement=create_table_autoincrement,
                 _uniques=create_table_uniques,
+                _column_definitions=create_table_generated_columns,
+                _table_options=create_table_options,
             ).strip()
         )
 
@@ -3110,8 +3278,8 @@ class Table(Queryable):
         for from_, to_ in copy_from_to.items():
             old_cols.append(from_)
             new_cols.append(to_)
-        # Ensure rowid is copied too
-        if "rowid" not in new_cols:
+        # Ensure rowid is copied too for rowid tables
+        if "WITHOUT ROWID" not in create_table_options and "rowid" not in new_cols:
             new_cols.insert(0, "rowid")
             old_cols.insert(0, "rowid")
 
@@ -3150,36 +3318,59 @@ class Table(Queryable):
                     "transformation and manually recreate the new index after running this transformation."
                 )
             dropped_index_column = next(
-                (column for column in index.columns if column in drop), None
+                (
+                    column
+                    for column in drop
+                    if column in existing_generated_columns
+                    and index_references_identifier(index_sql, column)
+                ),
+                None,
             )
-            renamed_index_column = next(
-                (column for column in index.columns if column in rename), None
+            if dropped_index_column is not None:
+                continue
+            dropped_index_column = next(
+                (
+                    column
+                    for column in drop
+                    if index_references_identifier(index_sql, column)
+                ),
+                None,
             )
             if dropped_index_column is not None:
                 raise TransformError(
                     f"Index '{index.name}' column '{dropped_index_column}' is not in updated table '{self.name}'. "
                     f"You must manually drop this index prior to running this transformation "
                     f"and manually recreate the new index after running this transformation. "
-                    f"The original index sql statement is: `{index_sql}`. No changes have been applied to this table."
-                )
+                f"The original index sql statement is: `{index_sql}`. "
+                "No changes have been applied to this table."
+            )
             xindex = xindexes_by_name[index.name]
             indexed_columns = sorted(
                 (column for column in xindex.columns if column.key),
                 key=lambda column: column.seqno,
             )
-            if (rename or drop) and (
-                index.partial or any(column.name is None for column in indexed_columns)
-            ):
-                raise TransformError(
-                    f"Index '{index.name}' is a partial or expression index, so it "
-                    f"cannot be safely recreated while columns are renamed or dropped. "
-                    f"You must manually drop this index prior to running this transformation "
-                    f"and manually recreate the new index after running this transformation. "
-                    f"The original index sql statement is: `{index_sql}`. No changes have been applied to this table."
+            renamed_index_column = next(
+                (
+                    column
+                    for column in rename
+                    if index_references_identifier(index_sql, column)
+                ),
+                None,
+            )
+            is_expression_index = any(
+                column.name is None for column in indexed_columns
+            ) or index.partial
+            if is_expression_index and renamed_index_column is not None:
+                index_sql = rewrite_index_sql(index_sql, rename)
+            if is_expression_index and renamed_index_column is not None:
+                index_drop_sqls.append(
+                    f"DROP INDEX IF EXISTS {quote_identifier(index.name)};"
                 )
-            if renamed_index_column is not None:
+            elif renamed_index_column is not None:
                 columns_sql = []
                 for column in indexed_columns:
+                    if column.name is None:
+                        continue
                     assert column.name is not None
                     column_sql = quote_identifier(
                         rename.get(column.name) or column.name
