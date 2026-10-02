@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_2_2:
+
+4.2.2 (unreleased)
+------------------
+
+- New ``Database.copy_foreign_key_closure()`` and ``Table.copy_foreign_key_closure()`` Python APIs copy selected rows and their declared foreign key dependency closure into another database while preserving key values. They support compound keys, self-references, cycles, repeated references, implicit ``rowid`` values, same-key row reuse, concrete conflict reporting and transactional rollback.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

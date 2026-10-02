@@ -1743,6 +1743,45 @@ Foreign keys that already exist are silently skipped, so repeated calls are idem
 .. note::
     In the CLI: :ref:`sqlite-utils add-foreign-keys <cli_add_foreign_keys>`
 
+.. _python_api_copy_foreign_key_closure:
+
+Copying rows and their foreign key dependencies
+-----------------------------------------------
+
+Use ``db.copy_foreign_key_closure(target, table, primary_keys)`` to copy selected rows to another ``Database`` together with every row reached by following declared foreign keys. Primary key and implicit ``rowid`` values are preserved.
+
+.. code-block:: python
+
+    target = Database("fault-sample.db")
+    result = source.copy_foreign_key_closure(
+        target,
+        "order_items",
+        [(10, "SKU-1", "blue")],
+    )
+
+The third argument accepts one scalar primary key, one tuple for a compound key, or a list of keys. The equivalent ``Table`` shortcut is useful for a single starting table:
+
+.. code-block:: python
+
+    result = source["order_items"].copy_foreign_key_closure(
+        target, [(10, "SKU-1", "blue")]
+    )
+
+Several starting tables can be supplied with a mapping:
+
+.. code-block:: python
+
+    source.copy_foreign_key_closure(
+        target,
+        {"orders": [10, 11], "products": [("SKU-1", "blue")]},
+    )
+
+Self-references and foreign key cycles are supported. If more than one foreign key reaches the same parent row, it is only inserted once. A ``NULL`` in any column of a compound foreign key means the whole foreign key is ``NULL`` and does not add a dependency.
+
+The source rows are collected in a single read transaction. The target insert runs in a transaction with deferred foreign key checks, allowing cycles to be inserted in any order, followed by ``PRAGMA foreign_key_check``. Missing tables are created from the source table definitions.
+
+Rows with the same primary key and identical values in every copied column are reused and returned in ``result.reused``. If a target row has the same key but different values, sqlite-utils raises ``sqlite_utils.db.ForeignKeyClosureConflictError`` containing concrete column differences and rolls the whole import back rather than overwriting data. A non-NULL foreign key with no matching source row raises ``sqlite_utils.db.MissingForeignKeyReferenceError`` and likewise leaves the target database unchanged.
+
 .. _python_api_index_foreign_keys:
 
 Adding indexes for all foreign keys

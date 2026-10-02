@@ -12,7 +12,7 @@ import re
 import secrets
 import textwrap
 import uuid
-from collections import namedtuple
+from collections import deque, namedtuple
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import TracebackType
@@ -304,6 +304,56 @@ class ForeignKey:
             )
 
 
+@dataclass(frozen=True)
+class ForeignKeyClosureRow:
+    """
+    A row included while copying a foreign key dependency closure.
+    """
+
+    table: str
+    primary_key: tuple[Any, ...]
+    row: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class MissingForeignKeyReference:
+    """
+    A non-NULL foreign key value that does not have a matching parent row.
+    """
+
+    table: str
+    primary_key: tuple[Any, ...]
+    columns: tuple[str, ...]
+    key: tuple[Any, ...]
+    other_table: str
+    other_columns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ForeignKeyClosureConflict:
+    """
+    A target row with the same primary key but different column values.
+    """
+
+    table: str
+    primary_key: tuple[Any, ...]
+    source_row: dict[str, Any]
+    existing_row: dict[str, Any]
+    differences: dict[str, tuple[Any, Any]]
+
+
+@dataclass(frozen=True)
+class CopyForeignKeyClosureResult:
+    """
+    Result of :meth:`Database.copy_foreign_key_closure`.
+    """
+
+    rows: tuple[ForeignKeyClosureRow, ...]
+    copied: tuple[ForeignKeyClosureRow, ...]
+    reused: tuple[ForeignKeyClosureRow, ...]
+    created_tables: tuple[str, ...]
+
+
 def _fk_actions_sql(fk: ForeignKey) -> str:
     "ON UPDATE/ON DELETE clauses for a foreign key, or an empty string."
     actions = ""
@@ -468,6 +518,47 @@ class TransactionError(Exception):
     "Operation cannot be performed while a transaction is open"
 
 
+class ForeignKeyClosureError(Exception):
+    "Base class for errors while copying a foreign key dependency closure"
+
+
+class MissingForeignKeyReferenceError(ForeignKeyClosureError):
+    "One or more non-NULL foreign keys do not have matching parent rows"
+
+    def __init__(self, references: Sequence[MissingForeignKeyReference]) -> None:
+        self.references = tuple(references)
+        lines = ["Missing foreign key references:"]
+        for reference in self.references:
+            lines.append(
+                "  {}.{} = {} references {}.{} = {}".format(
+                    reference.table,
+                    ", ".join(reference.columns),
+                    reference.key,
+                    reference.other_table,
+                    ", ".join(reference.other_columns),
+                    reference.key,
+                )
+            )
+        super().__init__("\n".join(lines))
+
+
+class ForeignKeyClosureConflictError(ForeignKeyClosureError):
+    "One or more target rows have the same key but different values"
+
+    def __init__(self, conflicts: Sequence[ForeignKeyClosureConflict]) -> None:
+        self.conflicts = tuple(conflicts)
+        lines = ["Refusing to overwrite conflicting rows:"]
+        for conflict in self.conflicts:
+            lines.append(
+                "  {} {} differs in {}".format(
+                    conflict.table,
+                    conflict.primary_key,
+                    ", ".join(conflict.differences),
+                )
+            )
+        super().__init__("\n".join(lines))
+
+
 class DescIndex(str):
     pass
 
@@ -533,6 +624,30 @@ def _first_keyword(sql: str) -> str:
     while j < n and (sql[j].isalpha() or sql[j] == "_"):
         j += 1
     return sql[i:j].upper()
+
+
+def _normalize_closure_roots(
+    roots: Mapping[str, Any | Iterable[Any]],
+) -> dict[str, list[tuple[Any, ...]]]:
+    normalized: dict[str, list[tuple[Any, ...]]] = {}
+    for table_name, keys in roots.items():
+        if isinstance(keys, (str, bytes, int, float, bool)) or keys is None:
+            table_keys = [(keys,)]
+        elif isinstance(keys, tuple):
+            table_keys = [keys]
+        elif isinstance(keys, list):
+            table_keys = [
+                (key,)
+                if not isinstance(key, (tuple, list))
+                else tuple(key)
+                for key in keys
+            ]
+        else:
+            table_keys = [
+                (key,) if not isinstance(key, tuple) else key for key in keys
+            ]
+        normalized.setdefault(table_name, []).extend(table_keys)
+    return normalized
 
 
 class Database:
@@ -2023,6 +2138,401 @@ class Database:
                     table.create_index(fk.columns, find_unique_name=True)
                     existing_indexes.add(fk_columns)
 
+    def copy_foreign_key_closure(
+        self,
+        target: "Database",
+        table: str | Mapping[str, Any | Iterable[Any]],
+        primary_keys: Any | Iterable[Any] = (),
+    ) -> CopyForeignKeyClosureResult:
+        """
+        Copy selected rows and every row referenced by their foreign keys.
+
+        Original primary key and ``rowid`` values are preserved. Compound keys,
+        self-references, cycles and rows reached through multiple foreign keys
+        are supported. Non-NULL keys must all resolve in the source database.
+
+        An existing target row is reused only when it has the same primary key
+        and identical values for every copied column. A same-key/different-value
+        row raises ``ForeignKeyClosureConflictError`` and rolls back the import.
+
+        :param target: Database that should receive the copied rows
+        :param table: Starting table, or a mapping of table names to keys
+        :param primary_keys: One key, or an iterable of keys for ``table``
+        """
+        if isinstance(table, Mapping):
+            roots = table
+        else:
+            if primary_keys == ():
+                raise ValueError("primary_keys is required")
+            roots = {table: primary_keys}
+
+        normalized_roots = _normalize_closure_roots(roots)
+        closure_rows, created_table_schemas = self._read_foreign_key_closure(
+            normalized_roots
+        )
+        return target._write_foreign_key_closure(
+            self, closure_rows, created_table_schemas
+        )
+
+    def _read_foreign_key_closure(
+        self, roots: Mapping[str, Sequence[tuple[Any, ...]]]
+    ) -> tuple[list[ForeignKeyClosureRow], dict[str, str]]:
+        table_cache: dict[str, Table] = {}
+        info_cache: dict[str, tuple[tuple[str, ...], list[str], str]] = {}
+
+        def table_for(name: str) -> Table:
+            if name not in table_cache:
+                canonical_name = resolve_casing(name, self.table_names())
+                table_obj = self.table(canonical_name)
+                if not table_obj.exists():
+                    raise NoTable(f"Table {canonical_name} does not exist")
+                if canonical_name in self.view_names() or table_obj.virtual_table_using:
+                    raise ValueError(
+                        "Foreign key closure can only copy ordinary tables, "
+                        f"not {canonical_name}"
+                    )
+                table_cache[name] = table_obj
+            return table_cache[name]
+
+        def info_for(name: str) -> tuple[tuple[str, ...], list[str], str]:
+            table_obj = table_for(name)
+            if name not in info_cache:
+                schema = self.execute(
+                    "select sql from sqlite_master where type = 'table' and name = ?",
+                    (table_obj.name,),
+                ).fetchone()[0]
+                xinfo = self.execute(
+                    f"PRAGMA table_xinfo({quote_identifier(table_obj.name)})"
+                ).fetchall()
+                writable_columns = [row[1] for row in xinfo if row[6] == 0]
+                if not schema:
+                    raise ValueError(f"Cannot copy internal table {table_obj.name}")
+                info_cache[name] = (
+                    tuple(table_obj.pks),
+                    writable_columns,
+                    schema,
+                )
+            return info_cache[name]
+
+        def fetch_rows(
+            name: str, columns: Sequence[str], keys: Iterable[tuple[Any, ...]]
+        ) -> Generator[dict[str, Any], None, None]:
+            table_obj = table_for(name)
+            key_columns, writable_columns, _schema = info_for(name)
+            select_columns = list(writable_columns)
+            if key_columns == ("rowid",):
+                select_columns.insert(0, "rowid")
+            select_sql = ", ".join(
+                "rowid" if column == "rowid" else quote_identifier(column)
+                for column in select_columns
+            )
+            for key in keys:
+                if len(key) != len(columns):
+                    raise ValueError(
+                        f"Expected {len(columns)} key values for {table_obj.name}, "
+                        f"got {len(key)}"
+                    )
+                where = " AND ".join(
+                    "rowid IS ?"
+                    if column == "rowid"
+                    else f"{quote_identifier(column)} IS ?"
+                    for column in columns
+                )
+                yield from table_obj.rows_where(
+                    where, tuple(key), select=select_sql
+                )
+
+        included: dict[tuple[str, tuple[Any, ...]], ForeignKeyClosureRow] = {}
+        queue: deque[tuple[str, tuple[Any, ...]]] = deque()
+        missing_references: list[MissingForeignKeyReference] = []
+
+        def include_row(table_name: str, row: dict[str, Any]) -> None:
+            key_columns = info_for(table_name)[0]
+            primary_key = tuple(row[column] for column in key_columns)
+            identity = (table_for(table_name).name, primary_key)
+            if identity not in included:
+                closure_row = ForeignKeyClosureRow(identity[0], primary_key, dict(row))
+                included[identity] = closure_row
+                queue.append(identity)
+
+        with self.atomic():
+            for table_name, keys in roots.items():
+                table_obj = table_for(table_name)
+                found = 0
+                key_columns = info_for(table_name)[0]
+                unique_keys = list(dict.fromkeys(keys))
+                for row in fetch_rows(table_obj.name, key_columns, unique_keys):
+                    found += 1
+                    include_row(table_obj.name, row)
+                if found != len(unique_keys):
+                    raise NotFoundError(
+                        f"One or more primary keys were not found in {table_obj.name}"
+                    )
+
+            while queue:
+                table_name, primary_key = queue.popleft()
+                closure_row = included[(table_name, primary_key)]
+                for fk in self.table(table_name).foreign_keys:
+                    foreign_key_values = tuple(
+                        closure_row.row.get(column) for column in fk.columns
+                    )
+                    if any(value is None for value in foreign_key_values):
+                        continue
+                    parent_names = self.table_names()
+                    parent_name = resolve_casing(fk.other_table, parent_names)
+                    if parent_name not in parent_names:
+                        missing_references.append(
+                            MissingForeignKeyReference(
+                                table_name,
+                                primary_key,
+                                tuple(fk.columns),
+                                foreign_key_values,
+                                fk.other_table,
+                                tuple(fk.other_columns),
+                            )
+                        )
+                        continue
+                    parent_rows = list(
+                        fetch_rows(
+                            parent_name,
+                            fk.other_columns,
+                            [foreign_key_values],
+                        )
+                    )
+                    if not parent_rows:
+                        missing_references.append(
+                            MissingForeignKeyReference(
+                                table_name,
+                                primary_key,
+                                tuple(fk.columns),
+                                foreign_key_values,
+                                parent_name,
+                                tuple(fk.other_columns),
+                            )
+                        )
+                        continue
+                    for parent_row in parent_rows:
+                        include_row(parent_name, parent_row)
+
+        if missing_references:
+            raise MissingForeignKeyReferenceError(missing_references)
+
+        closure = list(included.values())
+        schemas = {row.table: info_for(row.table)[2] for row in closure}
+        return closure, schemas
+
+    def _write_foreign_key_closure(
+        self,
+        source: "Database",
+        closure_rows: Sequence[ForeignKeyClosureRow],
+        source_schemas: Mapping[str, str],
+    ) -> CopyForeignKeyClosureResult:
+        target_names = set(self.table_names())
+        folded_target_names = {fold_identifier_case(name) for name in target_names}
+        created_tables: list[str] = []
+        conflicts: list[ForeignKeyClosureConflict] = []
+        reused: list[ForeignKeyClosureRow] = []
+        copied: list[ForeignKeyClosureRow] = []
+        table_columns: dict[str, tuple[tuple[str, ...], list[str], bool]] = {}
+
+        already_in_transaction = self.conn.in_transaction
+        foreign_keys_were_enabled = bool(
+            self.execute("PRAGMA foreign_keys").fetchone()[0]
+        )
+        if already_in_transaction and not foreign_keys_were_enabled:
+            raise TransactionError(
+                "copy_foreign_key_closure() requires PRAGMA foreign_keys=ON "
+                "before opening an existing transaction"
+            )
+        if not already_in_transaction and not foreign_keys_were_enabled:
+            self.execute("PRAGMA foreign_keys=ON")
+
+        try:
+            with self.atomic():
+                self.execute("PRAGMA defer_foreign_keys=ON")
+
+                for closure_row in closure_rows:
+                    source_table_name = closure_row.table
+                    target_name = resolve_casing(source_table_name, self.table_names())
+                    if fold_identifier_case(target_name) not in folded_target_names:
+                        self.execute(source_schemas[source_table_name])
+                        target_name = source_table_name
+                        target_names.add(target_name)
+                        folded_target_names.add(fold_identifier_case(target_name))
+                        created_tables.append(target_name)
+                    if target_name in self.view_names():
+                        raise ValueError(f"Cannot copy into view {target_name}")
+
+                for closure_row in closure_rows:
+                    source_table = source.table(closure_row.table)
+                    target_name = resolve_casing(closure_row.table, self.table_names())
+                    xinfo = self.execute(
+                        f"PRAGMA table_xinfo({quote_identifier(target_name)})"
+                    ).fetchall()
+                    writable_columns = [row[1] for row in xinfo if row[6] == 0]
+                    pk_rows = sorted(
+                        (row for row in xinfo if row[5]), key=lambda row: row[5]
+                    )
+                    key_columns = tuple(row[1] for row in pk_rows) or ("rowid",)
+                    source_key_columns = tuple(source_table.pks)
+                    if [
+                        fold_identifier_case(column) for column in key_columns
+                    ] != [
+                        fold_identifier_case(column)
+                        for column in source_key_columns
+                    ]:
+                        raise ValueError(
+                            f"Target table {target_name} does not have the same "
+                            f"primary key as source table {closure_row.table}"
+                        )
+                    folded_target_columns = [
+                        fold_identifier_case(column) for column in writable_columns
+                    ]
+                    for source_column in closure_row.row:
+                        if (
+                            source_column == "rowid"
+                            and source_key_columns == ("rowid",)
+                            and "rowid"
+                            not in [
+                                fold_identifier_case(column.name)
+                                for column in source_table.columns
+                            ]
+                        ):
+                            continue
+                        if (
+                            fold_identifier_case(source_column)
+                            not in folded_target_columns
+                        ):
+                            raise InvalidColumns(
+                                f"Target table {target_name} is missing column "
+                                f"{source_column}"
+                            )
+                    uses_implicit_rowid = source_key_columns == (
+                        "rowid",
+                    ) and "rowid" not in [
+                        fold_identifier_case(column.name)
+                        for column in source_table.columns
+                    ]
+                    table_columns[closure_row.table] = (
+                        key_columns,
+                        writable_columns,
+                        uses_implicit_rowid,
+                    )
+
+                for closure_row in closure_rows:
+                    key_columns, writable_columns, _uses_implicit_rowid = table_columns[
+                        closure_row.table
+                    ]
+                    target_name = resolve_casing(closure_row.table, self.table_names())
+                    target_columns_by_folded = {
+                        fold_identifier_case(column): column
+                        for column in writable_columns
+                    }
+                    select_columns = list(writable_columns)
+                    if key_columns == ("rowid",):
+                        select_columns.insert(0, "rowid")
+                    select_sql = ", ".join(
+                        "rowid" if column == "rowid" else quote_identifier(column)
+                        for column in select_columns
+                    )
+                    where = " AND ".join(
+                        "rowid IS ?"
+                        if column == "rowid"
+                        else f"{quote_identifier(column)} IS ?"
+                        for column in key_columns
+                    )
+                    existing_rows = list(
+                        self.table(target_name).rows_where(
+                            where, closure_row.primary_key, select=select_sql
+                        )
+                    )
+                    if not existing_rows:
+                        copied.append(closure_row)
+                        continue
+
+                    existing_row = existing_rows[0]
+                    differences = {}
+                    for source_column, source_value in closure_row.row.items():
+                        if (
+                            source_column == "rowid"
+                            and table_columns[closure_row.table][2]
+                        ):
+                            continue
+                        target_column = target_columns_by_folded[
+                            fold_identifier_case(source_column)
+                        ]
+                        existing_value = existing_row[target_column]
+                        if source_value != existing_value:
+                            differences[source_column] = (source_value, existing_value)
+                    if differences:
+                        conflicts.append(
+                            ForeignKeyClosureConflict(
+                                target_name,
+                                closure_row.primary_key,
+                                dict(closure_row.row),
+                                existing_row,
+                                differences,
+                            )
+                        )
+                    else:
+                        reused.append(closure_row)
+
+                if conflicts:
+                    raise ForeignKeyClosureConflictError(conflicts)
+
+                for closure_row in copied:
+                    _key_columns, target_columns, uses_implicit_rowid = table_columns[
+                        closure_row.table
+                    ]
+                    target_name = resolve_casing(closure_row.table, self.table_names())
+                    target_columns_by_folded = {
+                        fold_identifier_case(column): column
+                        for column in target_columns
+                    }
+                    insert_columns: list[str] = []
+                    values: list[Any] = []
+                    if uses_implicit_rowid:
+                        insert_columns.append("rowid")
+                        values.append(closure_row.row["rowid"])
+                    for source_column, source_value in closure_row.row.items():
+                        if source_column == "rowid" and uses_implicit_rowid:
+                            continue
+                        insert_columns.append(
+                            target_columns_by_folded[
+                                fold_identifier_case(source_column)
+                            ]
+                        )
+                        values.append(source_value)
+                    sql = "INSERT INTO {} ({}) VALUES ({})".format(
+                        quote_identifier(target_name),
+                        ", ".join(
+                            "rowid" if column == "rowid" else quote_identifier(column)
+                            for column in insert_columns
+                        ),
+                        ", ".join(["?"] * len(insert_columns)),
+                    )
+                    self.execute(sql, values)
+
+                violations = self.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise sqlite3.IntegrityError(
+                        f"Foreign key check failed: {violations}"
+                    )
+        finally:
+            if (
+                not already_in_transaction
+                and not foreign_keys_were_enabled
+                and not self.conn.in_transaction
+            ):
+                self.execute("PRAGMA foreign_keys=OFF")
+
+        return CopyForeignKeyClosureResult(
+            rows=tuple(closure_rows),
+            copied=tuple(copied),
+            reused=tuple(reused),
+            created_tables=tuple(created_tables),
+        )
+
     def vacuum(self) -> None:
         "Run a SQLite ``VACUUM`` against the database."
         self.execute("VACUUM;")
@@ -2626,6 +3136,17 @@ class Table(Queryable):
                 strict=cast(bool, strict),
             )
         return self
+
+    def copy_foreign_key_closure(
+        self, target: "Database", primary_keys: Any | Iterable[Any] = ()
+    ) -> CopyForeignKeyClosureResult:
+        """
+        Copy rows from this table and their foreign key dependencies.
+
+        Pass one scalar key, one tuple for a compound key, or a list of keys.
+        See :meth:`Database.copy_foreign_key_closure`.
+        """
+        return self.db.copy_foreign_key_closure(target, self.name, primary_keys)
 
     def duplicate(self, new_name: str) -> "Table":
         """
