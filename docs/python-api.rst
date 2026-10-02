@@ -959,6 +959,28 @@ To specify ``ON DELETE`` or ``ON UPDATE`` actions, pass ``ForeignKey`` objects i
 
 Foreign key actions are preserved by :ref:`table.transform() <python_api_transform>` - prior to sqlite-utils 4.0 they were silently dropped when a table was transformed.
 
+.. _python_api_foreign_key_closure:
+
+Copying a foreign key dependency closure
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``Database.copy_foreign_key_closure()`` to copy selected rows from one database into another, including every row reached by following outgoing foreign keys. Primary key values are preserved, including compound keys and implicit ``rowid`` values. Circular and self-referencing foreign keys are supported because the destination transaction uses deferred foreign-key enforcement.
+
+.. code-block:: python
+
+    result = source.copy_foreign_key_closure(
+        destination,
+        "order_items",
+        [("o1", 10, "A"), ("o1", 10, "B")],
+    )
+
+.. automethod:: sqlite_utils.db.Database.copy_foreign_key_closure
+   :noindex:
+
+The result records inserted and reused primary keys by table. An existing destination row is reused when every source column has the same value. If the same primary key exists with different values, ``sqlite_utils.db.ForeignKeyClosureConflict`` reports the differing columns and the entire import is rolled back. ``sqlite_utils.db.MissingForeignKeyReference`` is raised if the source itself contains a dangling foreign key; NULL foreign-key columns do not create dependencies.
+
+The destination tables and columns must already exist. The source is read in one transaction, and destination rows are inserted in another transaction; ``PRAGMA foreign_key_check`` is run before that transaction is committed.
+
 .. _python_api_table_configuration:
 
 Table configuration options

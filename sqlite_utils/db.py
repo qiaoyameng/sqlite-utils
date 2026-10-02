@@ -90,6 +90,43 @@ USING\s+(?P<using>\w+)          # for example USING FTS5
 )
 
 
+def _select_identifier(identifier: str) -> str:
+    if identifier == "rowid":
+        return "rowid"
+    return quote_identifier(identifier)
+
+
+def _normalize_primary_keys(
+    table: "Table", primary_keys: Iterable[Any | Sequence[Any]]
+) -> list[tuple[Any, ...]]:
+    if isinstance(primary_keys, tuple):
+        candidates: Iterable[Any | Sequence[Any]] = [primary_keys]
+    elif isinstance(primary_keys, (str, bytes)) or not isinstance(
+        primary_keys, Sequence
+    ):
+        candidates = [primary_keys]
+    else:
+        candidates = primary_keys
+
+    pk_count = len(table.pks)
+    keys = []
+    for candidate in candidates:
+        if isinstance(candidate, tuple):
+            key = candidate
+        elif isinstance(candidate, (str, bytes)) or not isinstance(
+            candidate, Sequence
+        ):
+            key = (candidate,)
+        else:
+            key = tuple(candidate)
+        if len(key) != pk_count:
+            raise BadPrimaryKey(
+                f"Table {table.name} requires {pk_count} primary key values"
+            )
+        keys.append(key)
+    return keys
+
+
 def quote_identifier(identifier: str) -> str:
     """
     Quote an identifier (table name, column name, etc.) using double quotes.
@@ -466,6 +503,84 @@ class InvalidColumns(Exception):
 
 class TransactionError(Exception):
     "Operation cannot be performed while a transaction is open"
+
+
+class ForeignKeyClosureError(Exception):
+    "A foreign-key dependency closure could not be copied"
+
+
+class MissingForeignKeyReference(ForeignKeyClosureError):
+    "A foreign key points to a row that does not exist in the source database"
+
+    def __init__(self, references: list["ForeignKeyReference"]):
+        self.references = references
+        first = references[0]
+        key = ", ".join(repr(value) for value in first.key_values)
+        message = (
+            f"Row {first.row_key!r} in table {first.table} references missing "
+            f"{key} in table {first.other_table}"
+        )
+        if len(references) > 1:
+            message += f" (and {len(references) - 1} more missing reference"
+            message += "s)" if len(references) > 2 else ")"
+        super().__init__(message)
+
+
+class ForeignKeyClosureConflict(ForeignKeyClosureError):
+    "The destination contains a primary key with different values"
+
+    def __init__(self, conflicts: list["ClosureRowConflict"]):
+        self.conflicts = conflicts
+        first = conflicts[0]
+        differences = ", ".join(
+            f"{column}: {first.source_values[column]!r} != {first.destination_values[column]!r}"
+            for column in first.differences
+        )
+        message = (
+            f"Conflicting row in {first.table} for primary key {first.key!r}: "
+            f"{differences}"
+        )
+        if len(conflicts) > 1:
+            message += f" (and {len(conflicts) - 1} more conflict"
+            message += "s)" if len(conflicts) > 2 else ")"
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class ForeignKeyReference:
+    """
+    A missing foreign-key reference encountered while collecting a closure.
+    """
+
+    table: str
+    row_key: tuple[Any, ...]
+    other_table: str
+    columns: tuple[str, ...]
+    other_columns: tuple[str, ...]
+    key_values: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class ClosureRowConflict:
+    """
+    A destination row with the same primary key but different column values.
+    """
+
+    table: str
+    key: tuple[Any, ...]
+    source_values: dict[str, Any]
+    destination_values: dict[str, Any]
+    differences: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ForeignKeyClosureResult:
+    """
+    Rows copied or reused while importing a foreign-key dependency closure.
+    """
+
+    inserted: dict[str, list[tuple[Any, ...]]]
+    reused: dict[str, list[tuple[Any, ...]]]
 
 
 class DescIndex(str):
@@ -1002,6 +1117,306 @@ class Database:
                 cursor.execute(statement)
             return cursor
         return self.conn.executescript(sql)
+
+    def copy_foreign_key_closure(
+        self,
+        destination: "Database",
+        table: str,
+        primary_keys: Iterable[Any | Sequence[Any]],
+    ) -> "ForeignKeyClosureResult":
+        """
+        Copy selected rows and every row referenced by their foreign keys.
+
+        Starting from ``primary_keys`` in ``table``, foreign-key edges are
+        followed to referenced rows. Existing rows in ``destination`` with
+        matching primary keys and values are reused; a matching primary key
+        with different values rolls back the whole operation.
+
+        Source rows are read from one transaction. Destination writes use a
+        transaction with deferred foreign-key enforcement, which allows
+        circular and self-referencing rows to be inserted. The destination
+        tables and columns must already exist.
+
+        :param destination: Database to copy rows into
+        :param table: Table containing the seed primary keys
+        :param primary_keys: Scalar key, one composite-key tuple, or an
+          iterable of either
+        """
+        if table not in self.table_names():
+            raise NoTable(f"Table {table} does not exist")
+        seed_keys = _normalize_primary_keys(self.table(table), primary_keys)
+        foreign_keys_were_on = (
+            destination.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        )
+        if not foreign_keys_were_on:
+            if destination.conn.in_transaction:
+                raise TransactionError(
+                    "Cannot enable PRAGMA foreign_keys while the destination "
+                    "transaction is already open"
+                )
+            destination.conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            with self.atomic():
+                closure = self._collect_foreign_key_closure(table, seed_keys)
+                return self._insert_foreign_key_closure(destination, closure)
+        finally:
+            if not foreign_keys_were_on and not destination.conn.in_transaction:
+                destination.conn.execute("PRAGMA foreign_keys = OFF")
+
+    def _collect_foreign_key_closure(
+        self,
+        table_name: str,
+        seed_keys: list[tuple[Any, ...]],
+    ) -> dict[str, dict[tuple[Any, ...], dict[str, Any]]]:
+        closure: dict[str, dict[tuple[Any, ...], dict[str, Any]]] = {}
+        missing: list[ForeignKeyReference] = []
+        missing_seen: set[tuple[Any, ...]] = set()
+        pending: list[tuple[str, tuple[Any, ...]]] = [
+            (table_name, key) for key in seed_keys
+        ]
+        seen: set[tuple[str, tuple[Any, ...]]] = set()
+
+        while pending:
+            current_table_name, current_key = pending.pop()
+            identity = (current_table_name, current_key)
+            if identity in seen:
+                continue
+            seen.add(identity)
+
+            current_table = self.table(current_table_name)
+            row = self._fetch_row_by_key(current_table, current_key)
+            if row is None:
+                raise NotFoundError(
+                    f"Table {current_table_name} has no row with primary key {current_key!r}"
+                )
+
+            table_rows = closure.setdefault(current_table_name, {})
+            table_rows[current_key] = row
+
+            for foreign_key in current_table.foreign_keys:
+                values = tuple(row.get(column) for column in foreign_key.columns)
+                if any(value is None for value in values):
+                    continue
+
+                other_table_name = foreign_key.other_table
+                other_table = self.table(other_table_name)
+                if tuple(foreign_key.other_columns) == tuple(other_table.pks):
+                    other_key = values
+                    referenced = self._fetch_row_by_key(other_table, other_key)
+                else:
+                    referenced = self._fetch_row_by_columns(
+                        other_table_name, tuple(foreign_key.other_columns), values
+                    )
+                    if referenced is not None:
+                        other_key = tuple(
+                            referenced[pk_column] for pk_column in other_table.pks
+                        )
+
+                if referenced is None:
+                    missing_identity = (
+                        current_table_name,
+                        current_key,
+                        other_table_name,
+                        tuple(foreign_key.columns),
+                        tuple(foreign_key.other_columns),
+                        values,
+                    )
+                    if missing_identity not in missing_seen:
+                        missing_seen.add(missing_identity)
+                        missing.append(
+                            ForeignKeyReference(
+                                table=current_table_name,
+                                row_key=current_key,
+                                other_table=other_table_name,
+                                columns=tuple(foreign_key.columns),
+                                other_columns=tuple(foreign_key.other_columns),
+                                key_values=values,
+                            )
+                        )
+                    continue
+
+                other_identity = (other_table_name, other_key)
+                if other_identity not in seen:
+                    pending.append(other_identity)
+
+        if missing:
+            missing.sort(
+                key=lambda item: (item.table, item.row_key, item.other_table)
+            )
+            raise MissingForeignKeyReference(missing)
+        return closure
+
+    def _fetch_row_by_key(
+        self, table: "Table", key: tuple[Any, ...]
+    ) -> dict[str, Any] | None:
+        pk_columns = tuple(table.pks)
+        if len(pk_columns) != len(key):
+            raise BadPrimaryKey(
+                f"Table {table.name} requires {len(pk_columns)} primary key values"
+            )
+        return self._fetch_row_by_columns(table.name, pk_columns, key)
+
+    def _fetch_row_by_columns(
+        self,
+        table_name: str,
+        columns: tuple[str, ...] | list[str],
+        values: tuple[Any, ...],
+    ) -> dict[str, Any] | None:
+        if len(columns) != len(values):
+            raise InvalidColumns("Column and value counts must match")
+        table = self.table(table_name)
+        select_columns = [
+            _select_identifier(column.name) for column in self._stored_columns(table)
+        ]
+        if table.use_rowid:
+            select_columns.insert(0, "rowid")
+        where = " AND ".join(
+            f"{_select_identifier(column)} = ?" for column in columns
+        )
+        sql = (
+            f"SELECT {', '.join(select_columns)} "
+            f"FROM {quote_identifier(table_name)} WHERE {where}"
+        )
+        cursor = self.execute(sql, values)
+        rows = cursor.fetchall()
+        if len(rows) > 1:
+            raise InvalidColumns(
+                f"Foreign-key target columns {tuple(columns)} in {table_name} are not unique"
+            )
+        if not rows:
+            return None
+        names = [description[0] for description in cursor.description]
+        return dict(zip(names, rows[0]))
+
+    def _insert_foreign_key_closure(
+        self,
+        destination: "Database",
+        closure: dict[str, dict[tuple[Any, ...], dict[str, Any]]],
+    ) -> "ForeignKeyClosureResult":
+        self._validate_closure_destination(destination, closure)
+
+        if destination.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise TransactionError("PRAGMA foreign_keys must be enabled")
+
+        inserted: dict[str, list[tuple[Any, ...]]] = {}
+        reused: dict[str, list[tuple[Any, ...]]] = {}
+        with destination.atomic():
+            destination.execute("PRAGMA defer_foreign_keys = ON")
+            conflicts: list[ClosureRowConflict] = []
+            keys_to_insert: dict[str, list[tuple[Any, ...]]] = {}
+
+            for table_name in closure:
+                source_table = self.table(table_name)
+                destination_table = destination.table(table_name)
+                compare_columns = self._insert_column_names(source_table)
+                for key, source_row in closure[table_name].items():
+                    existing = destination._fetch_row_by_key(
+                        destination_table, key
+                    )
+                    if existing is None:
+                        keys_to_insert.setdefault(table_name, []).append(key)
+                        continue
+
+                    source_values = {
+                        column: source_row[column] for column in compare_columns
+                    }
+                    destination_values = {
+                        column: existing[column] for column in compare_columns
+                    }
+                    differences = tuple(
+                        column
+                        for column in compare_columns
+                        if source_values[column] != destination_values[column]
+                    )
+                    if differences:
+                        conflicts.append(
+                            ClosureRowConflict(
+                                table=table_name,
+                                key=key,
+                                source_values=source_values,
+                                destination_values=destination_values,
+                                differences=differences,
+                            )
+                        )
+                    else:
+                        reused.setdefault(table_name, []).append(key)
+
+            if conflicts:
+                raise ForeignKeyClosureConflict(conflicts)
+
+            for table_name, keys in keys_to_insert.items():
+                source_table = self.table(table_name)
+                insert_columns = self._insert_column_names(source_table)
+                column_sql = ", ".join(
+                    _select_identifier(column) for column in insert_columns
+                )
+                placeholders = ", ".join("?" for _ in insert_columns)
+                sql = (
+                    f"INSERT INTO {quote_identifier(table_name)} "
+                    f"({column_sql}) VALUES ({placeholders})"
+                )
+                source_rows = closure[table_name]
+                for key in keys:
+                    row = source_rows[key]
+                    destination.execute(
+                        sql, tuple(row[column] for column in insert_columns)
+                    )
+                inserted[table_name] = keys
+
+            violations = destination.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError(
+                    f"Foreign key check failed: {violations}"
+                )
+        for keys in inserted.values():
+            keys.sort()
+        for keys in reused.values():
+            keys.sort()
+        return ForeignKeyClosureResult(inserted=inserted, reused=reused)
+
+    def _validate_closure_destination(
+        self,
+        destination: "Database",
+        closure: dict[str, dict[tuple[Any, ...], dict[str, Any]]],
+    ) -> None:
+        for table_name in closure:
+            if table_name not in destination.table_names():
+                raise NoTable(f"Destination table {table_name} does not exist")
+            source_table = self.table(table_name)
+            destination_table = destination.table(table_name)
+            source_pks = tuple(source_table.pks)
+            destination_pks = tuple(destination_table.pks)
+            if source_pks != destination_pks:
+                raise AlterError(
+                    f"Destination table {table_name} primary key {destination_pks} "
+                    f"does not match source {source_pks}"
+                )
+            source_columns = {column.name for column in source_table.columns}
+            destination_columns = {
+                column.name for column in destination_table.columns
+            }
+            missing_columns = source_columns - destination_columns
+            if missing_columns:
+                raise InvalidColumns(
+                    f"Destination table {table_name} is missing columns: "
+                    f"{sorted(missing_columns)}"
+                )
+
+    def _stored_columns(self, table: "Table") -> list[Column]:
+        rows = self.execute(
+            f"PRAGMA table_xinfo({quote_identifier(table.name)})"
+        ).fetchall()
+        return [
+            Column(row[0], row[1], row[2], row[3], row[4], row[5])
+            for row in rows
+            if row[6] not in (2, 3)
+        ]
+
+    def _insert_column_names(self, table: "Table") -> list[str]:
+        names = [column.name for column in self._stored_columns(table)]
+        if table.use_rowid:
+            names.insert(0, "rowid")
+        return names
 
     def table(self, table_name: str, **kwargs: Any) -> "Table":
         """
