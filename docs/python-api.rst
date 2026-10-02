@@ -2015,6 +2015,17 @@ A column-level check is removed if its owning column is dropped. Dropping a colu
 
 Comments immediately before or after a column definition are preserved too. They move with that column if it is renamed or reordered, and are removed if the column is dropped. A comment between two column definitions is treated as belonging to the following column.
 
+.. _python_api_transform_generated_columns:
+
+Generated columns
+-----------------
+
+``.transform()`` preserves ``VIRTUAL`` and ``STORED`` generated columns, including their expressions, constraints, indexes and position in the column order. Generated values are never copied to the new table - only ordinary columns are written, and SQLite recomputes the generated values itself.
+
+Renaming a column with ``rename=`` also rewrites real references to that column in generated expressions - string constants, function names and similarly named columns are left untouched.
+
+Dropping a column that a surviving generated column depends on raises ``TransformError`` before any change is made, with the dependency chain included in the message. Dropping the dependent generated columns at the same time is allowed.
+
 .. _python_api_transform_views:
 
 Tables referenced by views

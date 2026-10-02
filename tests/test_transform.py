@@ -1472,3 +1472,233 @@ def test_transform_refuses_to_drop_column_used_by_remaining_check(fresh_db):
     ):
         ranges.transform(drop={"maximum"})
     assert ranges.schema == schema_before
+
+
+def test_transform_sql_preserves_generated_columns(fresh_db):
+    fresh_db.execute("""
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            price REAL,
+            taxed REAL GENERATED ALWAYS AS (price * 1.1) STORED,
+            label TEXT AS (name || '!') VIRTUAL
+        )
+    """)
+    sqls = fresh_db.table("items").transform_sql(types={"price": float}, tmp_suffix="x")
+    assert sqls[0] == (
+        'CREATE TABLE "items_new_x" (\n'
+        '   "id" INTEGER PRIMARY KEY,\n'
+        '   "name" TEXT,\n'
+        '   "price" REAL,\n'
+        '   "taxed" REAL GENERATED ALWAYS AS (price * 1.1) STORED,\n'
+        '   "label" TEXT GENERATED ALWAYS AS (name || \'!\') VIRTUAL\n'
+        ');'
+    )
+    # Generated columns are computed by SQLite, not copied
+    assert sqls[1] == (
+        'INSERT INTO "items_new_x" ("rowid", "id", "name", "price")\n'
+        '   SELECT "rowid", "id", "name", "price" FROM "items";'
+    )
+
+
+def test_transform_generated_rename_rewrites_only_real_references(fresh_db):
+    fresh_db.execute("""
+        CREATE TABLE t (
+            val TEXT,
+            val2 TEXT,
+            g TEXT AS (upper(val) || 'val' || val2)
+        )
+    """)
+    fresh_db.table("t").transform(rename={"val": "v"})
+    schema = fresh_db.table("t").schema
+    # Real reference renamed; function name, string constant and the
+    # similarly named column val2 are untouched
+    assert "GENERATED ALWAYS AS (upper(v) || 'val' || val2)" in schema
+
+
+def test_transform_generated_rename_quoted_identifier(fresh_db):
+    fresh_db.execute("""
+        CREATE TABLE t (
+            "unit price" REAL,
+            taxed REAL AS ("unit price" * 1.1) STORED
+        )
+    """)
+    fresh_db.execute("INSERT INTO t (\"unit price\") VALUES (2.0)")
+    fresh_db.table("t").transform(rename={"unit price": "cost"})
+    schema = fresh_db.table("t").schema
+    assert 'GENERATED ALWAYS AS ("cost" * 1.1) STORED' in schema
+    assert list(fresh_db.table("t").rows) == [{"cost": 2.0, "taxed": 2.2}]
+
+
+def test_transform_generated_rename_generated_column_updates_dependents(fresh_db):
+    fresh_db.execute("""
+        CREATE TABLE t (
+            a INTEGER,
+            g1 INTEGER AS (a + 1),
+            g2 INTEGER AS (g1 * 2)
+        )
+    """)
+    fresh_db.table("t").transform(rename={"g1": "g1_renamed"})
+    schema = fresh_db.table("t").schema
+    assert "g1_renamed" in schema
+    assert "GENERATED ALWAYS AS (g1_renamed * 2)" in schema
+
+
+@pytest.mark.parametrize(
+    "drop,expected_chains",
+    (
+        (["a"], ["g1 -> a", "g2 -> g1 -> a"]),
+        (["g1"], ["g2 -> g1"]),
+        (["a", "g1"], ["g2 -> g1"]),
+    ),
+)
+def test_transform_generated_drop_dependency_refused(fresh_db, drop, expected_chains):
+    fresh_db.execute("""
+        CREATE TABLE t (
+            a INTEGER,
+            b INTEGER,
+            g1 INTEGER AS (a + 1),
+            g2 INTEGER AS (g1 * 2) STORED
+        )
+    """)
+    schema_before = fresh_db.table("t").schema
+    with pytest.raises(TransformError) as excinfo:
+        fresh_db.table("t").transform(drop=drop)
+    message = str(excinfo.value)
+    assert "Cannot drop columns referenced by generated columns" in message
+    for chain in expected_chains:
+        assert chain in message
+    # Refused before executing anything
+    assert fresh_db.table("t").schema == schema_before
+
+
+def test_transform_generated_drop_column_and_dependents_allowed(fresh_db):
+    fresh_db.execute("""
+        CREATE TABLE t (
+            a INTEGER,
+            b INTEGER,
+            g1 INTEGER AS (a + 1),
+            g2 INTEGER AS (g1 * 2) STORED
+        )
+    """)
+    fresh_db.execute("INSERT INTO t (a, b) VALUES (1, 2)")
+    fresh_db.table("t").transform(drop=["a", "g1", "g2"])
+    assert fresh_db.table("t").columns_dict == {"b": int}
+    assert list(fresh_db.table("t").rows) == [{"b": 2}]
+
+
+def test_transform_generated_drop_generated_column_allowed(fresh_db):
+    fresh_db.execute("""
+        CREATE TABLE t (
+            a INTEGER,
+            g INTEGER AS (a * 2) STORED
+        )
+    """)
+    fresh_db.execute("INSERT INTO t (a) VALUES (3)")
+    fresh_db.table("t").transform(drop=["g"])
+    assert list(fresh_db.table("t").rows) == [{"a": 3}]
+
+
+def test_transform_generated_roundtrip(tmpdir):
+    import sqlite_utils
+
+    path = str(tmpdir / "generated.db")
+    db = sqlite_utils.Database(path)
+    db.execute("""
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            "unit price" REAL,
+            taxed REAL GENERATED ALWAYS AS ("unit price" * 1.1) STORED,
+            summary TEXT AS (name || ':' || taxed) VIRTUAL
+        )
+    """)
+    db.execute("CREATE INDEX items_name_expr ON items (upper(name))")
+    db.execute("CREATE INDEX items_taxed ON items (taxed)")
+    db.execute("INSERT INTO items (name, \"unit price\") VALUES ('apple', 2.0)")
+    db.execute("INSERT INTO items (name, \"unit price\") VALUES ('Pear', 3.0)")
+
+    db.table("items").transform(not_null={"name"})
+
+    # Generated definitions, quoted identifier references and indexes survive
+    schema = db.table("items").schema
+    assert 'taxed" REAL GENERATED ALWAYS AS ("unit price" * 1.1) STORED' in schema
+    assert "summary" in schema
+    assert {index.name for index in db.table("items").indexes} == {
+        "items_name_expr",
+        "items_taxed",
+    }
+    # Existing rows still compute the right values
+    assert list(db.execute("SELECT name, taxed, summary FROM items ORDER BY id")) == [
+        ("apple", 2.2, "apple:2.2"),
+        ("Pear", 3.3000000000000003, "Pear:3.3000000000000003"),
+    ]
+    # Inserts and updates after the transform compute generated values
+    db.execute("INSERT INTO items (name, \"unit price\") VALUES ('plum', 10.0)")
+    db.execute("UPDATE items SET \"unit price\" = 4.0 WHERE name = 'apple'")
+    row = db.execute("SELECT taxed, summary FROM items WHERE name = 'plum'").fetchone()
+    assert row == (11.0, "plum:11.0")
+    assert db.execute("SELECT taxed FROM items WHERE name = 'apple'").fetchone() == (4.4,)
+    # The expression index is used and returns correct results
+    plan = db.execute(
+        "EXPLAIN QUERY PLAN SELECT id FROM items WHERE upper(name) = 'PEAR'"
+    ).fetchall()
+    assert any("items_name_expr" in line[-1] for line in plan)
+    assert db.execute(
+        "SELECT name FROM items WHERE upper(name) = 'PEAR'"
+    ).fetchall() == [("Pear",)]
+    # The index on the STORED generated column is used too
+    plan = db.execute(
+        "EXPLAIN QUERY PLAN SELECT id FROM items WHERE taxed = 11.0"
+    ).fetchall()
+    assert any("items_taxed" in line[-1] for line in plan)
+    assert db.execute("SELECT name FROM items WHERE taxed = 11.0").fetchall() == [
+        ("plum",)
+    ]
+    db.close()
+
+
+def test_transform_generated_constraints_and_column_order(fresh_db):
+    fresh_db.execute("""
+        CREATE TABLE t (
+            a INTEGER,
+            g INTEGER AS (a * 2) NOT NULL CHECK (g >= 0),
+            b TEXT
+        )
+    """)
+    fresh_db.execute("INSERT INTO t (a, b) VALUES (3, 'x')")
+    fresh_db.table("t").transform(column_order=["b", "g", "a"])
+    assert fresh_db.table("t").checks == [Check("g >= 0", column="g")]
+    assert list(fresh_db.table("t").rows) == [{"b": "x", "g": 6, "a": 3}]
+    schema = fresh_db.table("t").schema
+    assert '"g" INTEGER NOT NULL CHECK (g >= 0) GENERATED ALWAYS AS (a * 2)' in schema
+    # NOT NULL is still enforced on the generated column
+    with pytest.raises(sqlite3.IntegrityError):
+        fresh_db.execute("INSERT INTO t (a, b) VALUES (NULL, 'y')")
+
+
+def test_transform_generated_copy_failure_leaves_no_trace(fresh_db):
+    fresh_db.execute("""
+        CREATE TABLE t (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            label TEXT AS (name || '!')
+        )
+    """)
+    fresh_db.execute("INSERT INTO t (name) VALUES (NULL)")
+    schema_before = fresh_db.table("t").schema
+    rows_before = list(fresh_db.table("t").rows)
+    master_before = fresh_db.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name"
+    ).fetchall()
+    # Adding NOT NULL to a column containing NULL fails during the copy
+    with pytest.raises(sqlite3.IntegrityError):
+        fresh_db.table("t").transform(not_null={"name"})
+    assert fresh_db.table("t").schema == schema_before
+    assert list(fresh_db.table("t").rows) == rows_before
+    assert (
+        fresh_db.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name"
+        ).fetchall()
+        == master_before
+    )

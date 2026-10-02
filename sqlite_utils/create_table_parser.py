@@ -50,6 +50,17 @@ class Unique:
     end: int = field(default=-1, compare=False, repr=False)
 
 
+@dataclass
+class GeneratedColumn:
+    column: str
+    expression: str
+    # "VIRTUAL", "STORED" or "" when the column definition did not say
+    kind: str = ""
+    sql: str = field(default="", compare=False, repr=False)
+    start: int = field(default=-1, compare=False, repr=False)
+    end: int = field(default=-1, compare=False, repr=False)
+
+
 class ParseError(ValueError):
     pass
 
@@ -785,6 +796,63 @@ def parse_uniques(create_sql: str) -> list[Unique]:
     return uniques
 
 
+def parse_generated_columns(create_sql: str) -> list[GeneratedColumn]:
+    """Return generated columns from a valid SQLite CREATE TABLE statement."""
+    body_info = _table_body(create_sql)
+    if body_info is None:
+        return []
+    body, body_start = body_info
+    generated: list[GeneratedColumn] = []
+    for item, item_start, _ in _split_spans(body, _lex(body)):
+        item_tokens = _meaningful(_lex(item))
+        if not item_tokens:
+            continue
+        head = item_tokens[0]
+        if (
+            head.kind == "word" and head.text.upper() in _TABLE_CONSTRAINT_KEYWORDS
+        ) or head.is_keyword("CONSTRAINT"):
+            continue
+        column = _unquote(head.text)
+        index = 1
+        while index < len(item_tokens):
+            token = item_tokens[index]
+            if token.text == "(":
+                index = _matching_paren(item_tokens, index) + 1
+                continue
+            # A generated column is the only column definition in which a
+            # top-level AS is followed by a parenthesized expression
+            if (
+                token.is_keyword("AS")
+                and index + 1 < len(item_tokens)
+                and item_tokens[index + 1].text == "("
+            ):
+                close = _matching_paren(item_tokens, index + 1)
+                expression = item[
+                    item_tokens[index + 1].end : item_tokens[close].start
+                ].strip()
+                kind = ""
+                source_end = item_tokens[close].end
+                if close + 1 < len(item_tokens) and (
+                    item_tokens[close + 1].is_keyword("VIRTUAL")
+                    or item_tokens[close + 1].is_keyword("STORED")
+                ):
+                    kind = item_tokens[close + 1].text.upper()
+                    source_end = item_tokens[close + 1].end
+                generated.append(
+                    GeneratedColumn(
+                        column,
+                        expression,
+                        kind=kind,
+                        sql=item[item_tokens[index].start : source_end],
+                        start=body_start + item_start + item_tokens[index].start,
+                        end=body_start + item_start + source_end,
+                    )
+                )
+                break
+            index += 1
+    return generated
+
+
 def parse_column_comments(create_sql: str) -> dict[str, ColumnComments]:
     """Return comments immediately before and after each column definition."""
     body_info = _table_body(create_sql)
@@ -837,6 +905,16 @@ def check_references_identifier(expression: str, identifier: str) -> bool:
         and _ascii_fold(_unquote(token.text)) == folded
         for index, token in enumerate(tokens)
     )
+
+
+def expression_identifiers(expression: str) -> list[str]:
+    """Return the unquoted identifiers referenced by a SQL expression."""
+    tokens = _meaningful(_lex(expression))
+    return [
+        _unquote(token.text)
+        for index, token in enumerate(tokens)
+        if _is_identifier_token(tokens, index)
+    ]
 
 
 def sql_ends_in_line_comment(sql: str) -> bool:

@@ -7,12 +7,15 @@ from hypothesis import given
 from sqlite_utils.create_table_parser import (
     Check,
     ColumnComments,
+    GeneratedColumn,
     ParseError,
     Unique,
     UniqueColumn,
+    expression_identifiers,
     parse_autoincrement,
     parse_checks,
     parse_column_comments,
+    parse_generated_columns,
     parse_uniques,
 )
 
@@ -241,3 +244,34 @@ def test_check_like_text_inside_strings_is_opaque(value):
     assert len(checks) == 1
     assert checks[0].column == "value"
     assert checks[0].check == f"value != '{value}'"
+
+
+def test_parse_generated_columns():
+    sql = """
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY,
+            price REAL,
+            taxed REAL GENERATED ALWAYS AS (price * 1.1) STORED,
+            label TEXT AS (upper(name) || 'suffix'),
+            note TEXT DEFAULT (json_extract('{}', '$.a')),
+            "quoted col" INTEGER AS (price + 1) VIRTUAL
+        )
+    """
+    generated = parse_generated_columns(sql)
+    assert generated == [
+        GeneratedColumn("taxed", "price * 1.1", kind="STORED"),
+        GeneratedColumn("label", "upper(name) || 'suffix'"),
+        GeneratedColumn("quoted col", "price + 1", kind="VIRTUAL"),
+    ]
+    assert generated[0].sql == "AS (price * 1.1) STORED"
+    assert sql[generated[0].start : generated[0].end] == generated[0].sql
+
+
+def test_parse_generated_columns_none():
+    assert parse_generated_columns("CREATE TABLE t (id INTEGER, name TEXT)") == []
+
+
+def test_expression_identifiers_skips_strings_and_functions():
+    assert expression_identifiers(
+        "upper(name) || 'literal' || [other col] || \"double\""
+    ) == ["name", "other col", "double"]

@@ -29,13 +29,16 @@ from sqlite_utils.plugins import ensure_plugins_loaded, pm
 from .create_table_parser import (
     Check,
     ColumnComments,
+    GeneratedColumn,
     ParseError,
     Unique,
     UniqueColumn,
     check_references_identifier,
+    expression_identifiers,
     parse_autoincrement,
     parse_checks,
     parse_column_comments,
+    parse_generated_columns,
     parse_uniques,
     rewrite_check_expression,
     sql_ends_in_line_comment,
@@ -1444,6 +1447,7 @@ class Database:
         _column_comments: Mapping[str, ColumnComments] | None = None,
         _autoincrement: str | None = None,
         _uniques: Iterable[Unique] | None = None,
+        _generated: Mapping[str, tuple[str, str]] | None = None,
     ) -> str:
         """
         Returns the SQL ``CREATE TABLE`` statement for creating the specified table.
@@ -1492,6 +1496,10 @@ class Database:
         column_comments = {
             resolve_casing(name, columns): comments
             for name, comments in (_column_comments or {}).items()
+        }
+        generated = {
+            resolve_casing(name, columns): spec
+            for name, spec in (_generated or {}).items()
         }
         checks = list(_checks or ())
         checks_by_column: dict[str, list[Check]] = {}
@@ -1619,7 +1627,11 @@ class Database:
                     column_extras.append("AUTOINCREMENT")
             if column_name in not_null:
                 column_extras.append("NOT NULL")
-            if column_name in defaults and defaults[column_name] is not None:
+            if (
+                column_name in defaults
+                and defaults[column_name] is not None
+                and column_name not in generated
+            ):
                 column_extras.append(
                     f"DEFAULT {self.quote_default_value(defaults[column_name])}"
                 )
@@ -1636,6 +1648,13 @@ class Database:
                 _check_constraint_sql(check)
                 for check in checks_by_column.get(column_name, ())
             )
+            if column_name in generated:
+                generated_expression, generated_kind = generated[column_name]
+                column_extras.append(
+                    "GENERATED ALWAYS AS ({}) {}".format(
+                        generated_expression, generated_kind
+                    ).rstrip()
+                )
             column_type_str = COLUMN_TYPE_MAPPING[column_type]
             # Special case for strict tables to map FLOAT to REAL
             # Refs https://github.com/simonw/sqlite-utils/issues/644
@@ -2818,6 +2837,22 @@ class Table(Queryable):
         # Resolve column references against the existing schema, matching
         # case-insensitively the way SQLite does
         existing_columns = self.columns_dict
+        # PRAGMA table_info omits generated columns, so read their types and
+        # kinds from table_xinfo and their expressions from the schema
+        try:
+            existing_generated = parse_generated_columns(self.schema)
+        except ParseError as ex:
+            raise TransformError(
+                f"Could not parse table schema for table {self.name!r}: {ex}"
+            ) from ex
+        xinfo_rows: list[tuple] = []
+        if existing_generated:
+            xinfo_rows = self.db.execute(
+                f"PRAGMA table_xinfo({quote_identifier(self.name)})"
+            ).fetchall()
+            for row in xinfo_rows:
+                if row[6] in (2, 3) and row[1] not in existing_columns:
+                    existing_columns[row[1]] = column_affinity(row[2])
         types = {resolve_casing(c, existing_columns): t for c, t in types.items()}
         rename = {resolve_casing(c, existing_columns): v for c, v in rename.items()}
         drop = {resolve_casing(c, existing_columns) for c in drop}
@@ -2839,6 +2874,61 @@ class Table(Queryable):
             }
         if column_order is not None:
             column_order = [resolve_casing(c, existing_columns) for c in column_order]
+
+        generated_columns: dict[str, GeneratedColumn] = {}
+        if existing_generated:
+            hidden_by_name = {row[1]: row[6] for row in xinfo_rows}
+            for generated in existing_generated:
+                name = resolve_casing(generated.column, existing_columns)
+                kind = generated.kind or (
+                    "STORED" if hidden_by_name.get(name) == 3 else "VIRTUAL"
+                )
+                generated_columns[name] = GeneratedColumn(
+                    name, generated.expression, kind=kind
+                )
+
+        if generated_columns and drop:
+            # A generated column's expression may reference other columns,
+            # including other generated columns. Refuse to drop any column a
+            # surviving generated column still depends on, directly or
+            # through a chain of generated columns.
+            names_by_fold = {
+                fold_identifier_case(name): name for name in existing_columns
+            }
+            dependencies: dict[str, set[str]] = {}
+            for name, generated in generated_columns.items():
+                dependencies[name] = {
+                    names_by_fold[folded]
+                    for folded in (
+                        fold_identifier_case(identifier)
+                        for identifier in expression_identifiers(
+                            generated.expression
+                        )
+                    )
+                    if folded in names_by_fold and names_by_fold[folded] != name
+                }
+            broken_chains: list[list[str]] = []
+            for name in generated_columns:
+                if name in drop:
+                    continue
+                stack = [(name, [name])]
+                visited = {name}
+                while stack:
+                    node, chain = stack.pop()
+                    for referenced in sorted(dependencies.get(node, ())):
+                        if referenced in visited:
+                            continue
+                        visited.add(referenced)
+                        referenced_chain = chain + [referenced]
+                        if referenced in drop:
+                            broken_chains.append(referenced_chain)
+                        elif referenced in dependencies:
+                            stack.append((referenced, referenced_chain))
+            if broken_chains:
+                raise TransformError(
+                    "Cannot drop columns referenced by generated columns: "
+                    + "; ".join(" -> ".join(chain) for chain in broken_chains)
+                )
 
         try:
             existing_checks = self.checks
@@ -2907,6 +2997,17 @@ class Table(Queryable):
             owner = resolve_casing(column, existing_columns)
             if owner not in drop:
                 create_table_column_comments[rename.get(owner) or owner] = comments
+
+        # Generated columns keep their expressions; only real column
+        # references are rewritten, not string constants or function names
+        create_table_generated: dict[str, tuple[str, str]] = {}
+        for name, generated in generated_columns.items():
+            if name in drop:
+                continue
+            create_table_generated[rename.get(name) or name] = (
+                rewrite_check_expression(generated.expression, rename),
+                generated.kind,
+            )
 
         create_table_foreign_keys: list[ForeignKeyIndicator] = []
 
@@ -2986,7 +3087,15 @@ class Table(Queryable):
                     create_table_foreign_keys.append(fk_with_renamed_columns(fk))
 
         new_table_name = f"{self.name}_new_{tmp_suffix or os.urandom(6).hex()}"
-        current_column_pairs = list(self.columns_dict.items())
+        if generated_columns:
+            # table_xinfo preserves the declared order of generated columns
+            current_column_pairs = [
+                (row[1], column_affinity(row[2]))
+                for row in xinfo_rows
+                if row[6] != 1
+            ]
+        else:
+            current_column_pairs = list(self.columns_dict.items())
         new_column_pairs = []
         copy_from_to = {column: column for column, _ in current_column_pairs}
         for name, type_ in current_column_pairs:
@@ -2996,7 +3105,11 @@ class Table(Queryable):
                 continue
             new_name = rename.get(name) or name
             new_column_pairs.append((new_name, type_))
-            copy_from_to[name] = new_name
+            if name in generated_columns:
+                # Generated values are computed by SQLite, not copied
+                del copy_from_to[name]
+            else:
+                copy_from_to[name] = new_name
 
         if existing_autoincrement:
             existing_autoincrement = resolve_casing(
@@ -3042,6 +3155,12 @@ class Table(Queryable):
             if c.notnull
             if c.name not in drop
         }
+        if generated_columns:
+            create_table_not_null.update(
+                rename.get(row[1]) or row[1]
+                for row in xinfo_rows
+                if row[6] in (2, 3) and row[3] and row[1] not in drop
+            )
         if isinstance(not_null, dict):
             # Remove any columns with a value of False
             for key, value in not_null.items():
@@ -3088,6 +3207,7 @@ class Table(Queryable):
                 _column_comments=create_table_column_comments,
                 _autoincrement=create_table_autoincrement,
                 _uniques=create_table_uniques,
+                _generated=create_table_generated,
             ).strip()
         )
 
