@@ -322,6 +322,88 @@ XIndexColumn = namedtuple(
 Trigger = namedtuple("Trigger", ("name", "table", "sql"))
 
 
+class ChangeLogBatch(namedtuple("ChangeLogBatchBase", ("changes", "next_cursor"))):
+    @property
+    def events(self) -> list["ChangeLogEvent"]:
+        return self.changes
+
+    @property
+    def cursor(self) -> int:
+        return self.next_cursor
+
+
+class ChangeLogEvent(dict):
+    "A single inserted, updated, or deleted row recorded in a table change log."
+
+    @property
+    def sequence(self) -> int:
+        return self["seq"]
+
+    @property
+    def cursor(self) -> int:
+        return self["seq"]
+
+    @property
+    def seq(self) -> int:
+        return self["seq"]
+
+    @property
+    def operation(self) -> str:
+        return self["op"]
+
+    @property
+    def op(self) -> str:
+        return self["op"]
+
+    @property
+    def action(self) -> str:
+        return self["op"]
+
+    @property
+    def kind(self) -> str:
+        return self["op"]
+
+    @property
+    def old_pk(self) -> Any:
+        return self["old_pk"]
+
+    @property
+    def new_pk(self) -> Any:
+        return self["new_pk"]
+
+    @property
+    def pk(self) -> Any:
+        return self["pk"]
+
+    @property
+    def table(self) -> str:
+        return self["table"]
+
+    @property
+    def old(self) -> dict[str, Any] | None:
+        return self["old_values"]
+
+    @property
+    def before(self) -> dict[str, Any] | None:
+        return self["old_values"]
+
+    @property
+    def old_values(self) -> dict[str, Any] | None:
+        return self["old_values"]
+
+    @property
+    def new(self) -> dict[str, Any] | None:
+        return self["new_values"]
+
+    @property
+    def after(self) -> dict[str, Any] | None:
+        return self["new_values"]
+
+    @property
+    def new_values(self) -> dict[str, Any] | None:
+        return self["new_values"]
+
+
 class TransformError(Exception):
     pass
 
@@ -468,6 +550,22 @@ class TransactionError(Exception):
     "Operation cannot be performed while a transaction is open"
 
 
+class ChangeLogGapError(Exception):
+    "Requested change log cursor is older than the oldest retained sequence."
+
+    def __init__(self, cursor: int, oldest_sequence: int | None):
+        self.cursor = cursor
+        self.oldest_sequence = oldest_sequence
+        if oldest_sequence is None:
+            message = f"Change log cursor {cursor} is no longer available"
+        else:
+            message = (
+                f"Change log cursor {cursor} is too old; the oldest retained "
+                f"sequence is {oldest_sequence}"
+            )
+        super().__init__(message)
+
+
 class DescIndex(str):
     pass
 
@@ -485,6 +583,91 @@ CREATE TABLE IF NOT EXISTS "{}"(
    count INTEGER DEFAULT 0
 );
 """.strip()
+
+_CHANGE_LOG_TABLE_NAME = "_sqlite_utils_changes"
+_CHANGE_LOG_CURSORS_TABLE_NAME = "_sqlite_utils_change_cursors"
+_CHANGE_LOG_TRACKED_TABLE_NAME = "_sqlite_utils_change_tables"
+_CHANGE_LOG_SEQUENCE_TABLE_NAME = "_sqlite_utils_change_sequence"
+_CHANGE_LOG_TRIGGER_MARKER = "-- sqlite-utils-change-log"
+
+_CHANGE_LOG_TABLE_CREATE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {quote_identifier(_CHANGE_LOG_TABLE_NAME)}(
+    seq INTEGER PRIMARY KEY,
+    "table" TEXT NOT NULL,
+    op TEXT NOT NULL CHECK (op IN ('INSERT', 'UPDATE', 'DELETE')),
+    old_pk TEXT,
+    new_pk TEXT,
+    old_values TEXT,
+    new_values TEXT
+);
+CREATE INDEX IF NOT EXISTS {quote_identifier(_CHANGE_LOG_TABLE_NAME + "_table_seq")}
+ON {quote_identifier(_CHANGE_LOG_TABLE_NAME)} ("table", seq);
+""".strip()
+
+_CHANGE_LOG_CURSORS_TABLE_CREATE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {quote_identifier(_CHANGE_LOG_CURSORS_TABLE_NAME)}(
+    consumer TEXT NOT NULL,
+    "table" TEXT,
+    cursor INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (consumer, "table")
+);
+""".strip()
+
+_CHANGE_LOG_TRACKED_TABLE_CREATE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {quote_identifier(_CHANGE_LOG_TRACKED_TABLE_NAME)}(
+    "table" TEXT PRIMARY KEY,
+    pk_columns TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    pruned_seq INTEGER NOT NULL DEFAULT 0
+);
+""".strip()
+
+_CHANGE_LOG_SEQUENCE_TABLE_CREATE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {quote_identifier(_CHANGE_LOG_SEQUENCE_TABLE_NAME)}(
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    value INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO {quote_identifier(_CHANGE_LOG_SEQUENCE_TABLE_NAME)}(id, value)
+VALUES (1, 0);
+""".strip()
+
+
+def _change_log_json_value_expression(alias: str, column: str) -> str:
+    quoted_column = quote_identifier(column)
+    return f"""
+CASE WHEN typeof({alias}.{quoted_column}) = 'blob'
+THEN json_object('__sqlite_utils_blob__', lower(hex({alias}.{quoted_column})))
+ELSE json_quote({alias}.{quoted_column}) END""".strip()
+
+
+def _change_log_json_object(alias: str, columns: Iterable[str]) -> str:
+    parts = []
+    for column in columns:
+        key = column.replace("'", "''")
+        parts.append(f"'{key}'")
+        parts.append(_change_log_json_value_expression(alias, column))
+    return "json_object(" + ", ".join(parts) + ")" if parts else "'{}'"
+
+
+def _change_log_json_array(alias: str, columns: Iterable[str]) -> str:
+    parts = [_change_log_json_value_expression(alias, column) for column in columns]
+    return "json_array(" + ", ".join(parts) + ")"
+
+
+def _decode_change_log_json(value: str | bytes | None) -> Any:
+    if value is None:
+        return None
+
+    def decode(item: Any) -> Any:
+        if isinstance(item, dict):
+            if set(item) == {"__sqlite_utils_blob__"}:
+                return bytes.fromhex(item["__sqlite_utils_blob__"])
+            return {key: decode(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [decode(child) for child in item]
+        return item
+
+    return decode(json.loads(value))
 
 
 _TRANSACTION_CONTROL_KEYWORDS = {
@@ -1202,6 +1385,275 @@ class Database:
         https://www.sqlite.org/pragma.html#pragma_journal_mode
         """
         return self.execute("PRAGMA journal_mode;").fetchone()[0]
+
+    def _create_change_log_tables(self) -> None:
+        with self.atomic():
+            self._executescript(
+                "\n".join(
+                    [
+                        _CHANGE_LOG_TABLE_CREATE_SQL,
+                        _CHANGE_LOG_CURSORS_TABLE_CREATE_SQL,
+                        _CHANGE_LOG_TRACKED_TABLE_CREATE_SQL,
+                        _CHANGE_LOG_SEQUENCE_TABLE_CREATE_SQL,
+                    ]
+                )
+            )
+
+    def _change_log_exists(self) -> bool:
+        return all(
+            name in self.table_names()
+            for name in (
+                _CHANGE_LOG_TABLE_NAME,
+                _CHANGE_LOG_CURSORS_TABLE_NAME,
+                _CHANGE_LOG_TRACKED_TABLE_NAME,
+                _CHANGE_LOG_SEQUENCE_TABLE_NAME,
+            )
+        )
+
+    def _validate_change_cursor(self, cursor: int) -> None:
+        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+            raise ValueError("cursor must be a non-negative integer")
+
+    def _ensure_change_cursor_available(
+        self, cursor: int, table_name: str | None = None
+    ) -> None:
+        if not self._change_log_exists():
+            return
+        if table_name is None:
+            row = self.execute(
+                f"SELECT min(seq) FROM {quote_identifier(_CHANGE_LOG_TABLE_NAME)}"
+            ).fetchone()
+            oldest_sequence = row[0]
+            if oldest_sequence is not None and cursor < oldest_sequence:
+                raise ChangeLogGapError(cursor, oldest_sequence)
+            return
+        table_row = self.execute(
+            f"SELECT enabled, pruned_seq FROM {quote_identifier(_CHANGE_LOG_TRACKED_TABLE_NAME)} "
+            'WHERE "table" = ?',
+            (table_name,),
+        ).fetchone()
+        table_oldest = table_row[1] if table_row is not None else 0
+        if table_oldest and cursor < table_oldest:
+            raise ChangeLogGapError(cursor, table_oldest + 1)
+
+    def read_changes(
+        self,
+        cursor: int = 0,
+        *,
+        table: str | None = None,
+        limit: int = 100,
+        consumer: str = "default",
+        consumer_id: str | None = None,
+        batch_size: int | None = None,
+    ) -> ChangeLogBatch:
+        self._validate_change_cursor(cursor)
+        if consumer_id is not None:
+            consumer = consumer_id
+        if batch_size is not None:
+            limit = batch_size
+        if limit <= 0:
+            raise ValueError("limit must be greater than zero")
+        self._ensure_change_cursor_available(cursor, table)
+        where_parts = ["seq > ?"]
+        parameters: list[Any] = [cursor]
+        if table is not None:
+            where_parts.append('"table" = ?')
+            parameters.append(table)
+        sql = (
+            'SELECT seq, "table", op, old_pk, new_pk, old_values, new_values '
+            f"FROM {quote_identifier(_CHANGE_LOG_TABLE_NAME)} "
+            f"WHERE {' AND '.join(where_parts)} ORDER BY seq LIMIT ?"
+        )
+        parameters.append(limit)
+        rows = self.execute(sql, parameters).fetchall()
+        changes = [self._decode_change_log_row(row) for row in rows]
+        next_cursor = rows[-1][0] if rows else cursor
+        return ChangeLogBatch(changes, next_cursor)
+
+    def changes(
+        self,
+        cursor: int = 0,
+        *,
+        table: str | None = None,
+        limit: int = 100,
+        consumer: str = "default",
+        consumer_id: str | None = None,
+        batch_size: int | None = None,
+    ) -> ChangeLogBatch:
+        return self.read_changes(
+            cursor,
+            table=table,
+            limit=limit,
+            consumer=consumer,
+            consumer_id=consumer_id,
+            batch_size=batch_size,
+        )
+
+    def _decode_change_log_row(self, row: Sequence[Any]) -> ChangeLogEvent:
+        seq, table_name, op, old_pk, new_pk, old_values, new_values = row
+        pk = new_pk if op != "DELETE" else old_pk
+
+        def decode_pk(value: str | bytes | None) -> Any:
+            decoded = _decode_change_log_json(value)
+            if isinstance(decoded, list) and len(decoded) == 1:
+                return decoded[0]
+            if isinstance(decoded, list):
+                return tuple(decoded)
+            return decoded
+
+        return ChangeLogEvent(
+            seq=seq,
+            sequence=seq,
+            table=table_name,
+            op=op,
+            operation=op,
+            old_pk=decode_pk(old_pk),
+            new_pk=decode_pk(new_pk),
+            old_values=_decode_change_log_json(old_values),
+            new_values=_decode_change_log_json(new_values),
+            pk=decode_pk(pk),
+        )
+
+    def acknowledge_changes(
+        self,
+        cursor: int,
+        *,
+        table: str | None = None,
+        consumer: str = "default",
+        consumer_id: str | None = None,
+    ) -> int:
+        self._validate_change_cursor(cursor)
+        if consumer_id is not None:
+            consumer = consumer_id
+        self._ensure_change_cursor_available(cursor, table)
+        with self.atomic():
+            self._executescript(_CHANGE_LOG_CURSORS_TABLE_CREATE_SQL)
+            self.execute(
+                f"INSERT INTO {quote_identifier(_CHANGE_LOG_CURSORS_TABLE_NAME)} "
+                '(consumer, "table", cursor) VALUES (?, ?, ?) '
+                'ON CONFLICT(consumer, "table") DO UPDATE SET '
+                "cursor = max(cursor, excluded.cursor)",
+                (consumer, table, cursor),
+            )
+        return cursor
+
+    def ack_changes(
+        self,
+        cursor: int,
+        *,
+        table: str | None = None,
+        consumer: str = "default",
+        consumer_id: str | None = None,
+    ) -> int:
+        return self.acknowledge_changes(
+            cursor, table=table, consumer=consumer, consumer_id=consumer_id
+        )
+
+    def change_log_watermark(
+        self, consumer: str | None = "default", *, table: str | None = None
+    ) -> int | None:
+        if not self._change_log_exists():
+            return None
+        where_parts = []
+        parameters: list[Any] = []
+        if consumer is not None:
+            where_parts.append("consumer = ?")
+            parameters.append(consumer)
+        where_parts.append('"table" IS ' + ("NOT NULL" if table is not None else "NULL"))
+        if table is not None:
+            where_parts.append('"table" = ?')
+            parameters.append(table)
+        sql = (
+            f"SELECT min(cursor) FROM {quote_identifier(_CHANGE_LOG_CURSORS_TABLE_NAME)} "
+            f"WHERE {' AND '.join(where_parts)}"
+        )
+        if consumer is None:
+            return self.execute(
+                sql, parameters
+            ).fetchone()[0]
+        exists = self.execute(
+            f"SELECT 1 FROM {quote_identifier(_CHANGE_LOG_CURSORS_TABLE_NAME)} "
+            f"WHERE {' AND '.join(where_parts)} LIMIT 1",
+            parameters,
+        ).fetchone()
+        if not exists:
+            return 0
+        return self.execute(sql, parameters).fetchone()[0]
+
+    def acknowledged_changes(
+        self, consumer: str | None = "default", *, table: str | None = None
+    ) -> int | None:
+        return self.change_log_watermark(consumer, table=table)
+
+    def _change_log_prune_watermark(
+        self, consumer: str | None, table: str | None
+    ) -> int | None:
+        if not self._change_log_exists():
+            return None
+        where_parts = []
+        parameters: list[Any] = []
+        if consumer is not None:
+            where_parts.append("consumer = ?")
+            parameters.append(consumer)
+        if table is None:
+            where_parts.append('"table" IS NULL')
+        if table is not None:
+            where_parts.append('("table" IS NULL OR "table" = ?)')
+            parameters.append(table)
+        where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        return self.execute(
+            f"SELECT min(cursor) FROM {quote_identifier(_CHANGE_LOG_CURSORS_TABLE_NAME)}"
+            f"{where_sql}",
+            parameters,
+        ).fetchone()[0]
+
+    def prune_changes(
+        self,
+        *,
+        consumer: str | None = "default",
+        table: str | None = None,
+        consumer_id: str | None = None,
+    ) -> int:
+        if consumer_id is not None:
+            consumer = consumer_id
+        if not self._change_log_exists():
+            return 0
+        watermark = self._change_log_prune_watermark(consumer, table)
+        if not watermark:
+            return 0
+        self._ensure_change_cursor_available(watermark, table)
+        where_parts = ["seq <= ?"]
+        parameters: list[Any] = [watermark]
+        if table is not None:
+            where_parts.append('"table" = ?')
+            parameters.append(table)
+        with self.atomic():
+            tracked_table = quote_identifier(_CHANGE_LOG_TRACKED_TABLE_NAME)
+            change_table = quote_identifier(_CHANGE_LOG_TABLE_NAME)
+            if table is None:
+                self.execute(
+                    f"UPDATE {tracked_table} "
+                    "SET pruned_seq = max(pruned_seq, COALESCE(( "
+                    f"SELECT max(seq) FROM {change_table} "
+                    f'WHERE {tracked_table}."table" = {change_table}."table" '
+                    "AND seq <= ?), 0))",
+                    [watermark],
+                )
+            else:
+                self.execute(
+                    f"UPDATE {tracked_table} "
+                    "SET pruned_seq = max(pruned_seq, COALESCE(( "
+                    f"SELECT max(seq) FROM {change_table} "
+                    f'WHERE {change_table}."table" = ? AND seq <= ?), 0)) '
+                    f'WHERE {tracked_table}."table" = ?',
+                    [table, watermark, table],
+                )
+            cursor = self.execute(
+                f"DELETE FROM {quote_identifier(_CHANGE_LOG_TABLE_NAME)} "
+                f"WHERE {' AND '.join(where_parts)}",
+                parameters,
+            )
+        return cursor.rowcount
 
     def enable_wal(self) -> None:
         """
@@ -3741,6 +4193,205 @@ class Table(Queryable):
         with self.db.atomic():
             self.db._executescript(sql)
         self.db.use_counts_table = True
+
+    def _change_log_trigger_names(self) -> dict[str, str]:
+        return {
+            suffix: f"{self.name}_sqlite_utils_changes_{suffix}"
+            for suffix in ("insert", "update", "delete")
+        }
+
+    def _change_log_trigger_sql(self, operation: str) -> str:
+        trigger_name = self._change_log_trigger_names()[
+            {"INSERT": "insert", "UPDATE": "update", "DELETE": "delete"}[operation]
+        ]
+        columns = [column.name for column in self.columns]
+        pk_columns = self.pks
+        if operation == "INSERT":
+            alias, old_pk, new_pk, old_values = "NEW", "NULL", None, "NULL"
+            new_values = _change_log_json_object("NEW", columns)
+        elif operation == "DELETE":
+            alias, old_pk, new_pk, new_values = "OLD", None, "NULL", "NULL"
+            old_values = _change_log_json_object("OLD", columns)
+        else:
+            alias = "NEW"
+            old_values = _change_log_json_object("OLD", columns)
+            new_values = _change_log_json_object("NEW", columns)
+            old_pk = new_pk = None
+        if new_pk is None:
+            new_pk = _change_log_json_array("NEW", pk_columns)
+        if old_pk is None:
+            old_pk = _change_log_json_array("OLD", pk_columns)
+        return f"""
+CREATE TRIGGER {quote_identifier(trigger_name)}
+AFTER {operation} ON {quote_identifier(self.name)}
+{_CHANGE_LOG_TRIGGER_MARKER}
+BEGIN
+    UPDATE {quote_identifier(_CHANGE_LOG_SEQUENCE_TABLE_NAME)}
+    SET value = value + 1 WHERE id = 1;
+    INSERT INTO {quote_identifier(_CHANGE_LOG_TABLE_NAME)}
+        (seq, "table", op, old_pk, new_pk, old_values, new_values)
+    VALUES (
+        (SELECT value FROM {quote_identifier(_CHANGE_LOG_SEQUENCE_TABLE_NAME)} WHERE id = 1),
+        {self.db.quote(self.name)},
+        '{operation}',
+        {old_pk},
+        {new_pk},
+        {old_values},
+        {new_values}
+    );
+END
+""".strip()
+
+    def enable_changes(self) -> "Table":
+        "Enable an append-only trigger-backed change log for this table."
+        if not self.exists():
+            raise NoTable(f"Table {self.name} does not exist")
+        if self.name in (
+            _CHANGE_LOG_TABLE_NAME,
+            _CHANGE_LOG_CURSORS_TABLE_NAME,
+            _CHANGE_LOG_TRACKED_TABLE_NAME,
+            _CHANGE_LOG_SEQUENCE_TABLE_NAME,
+        ):
+            raise AlterError(
+                "Change logs cannot be enabled on internal change log tables"
+            )
+        if self.virtual_table_using is not None:
+            raise AlterError("Change logs cannot be enabled on virtual tables")
+        existing_triggers = self.triggers_dict
+        for trigger_name in self._change_log_trigger_names().values():
+            sql = existing_triggers.get(trigger_name)
+            if sql is not None and _CHANGE_LOG_TRIGGER_MARKER not in sql:
+                raise AlterError(
+                    f"Trigger {trigger_name} already exists and was not created by sqlite-utils"
+                )
+        self.db._create_change_log_tables()
+        pk_columns = self.pks
+        trigger_sql = [
+            f"DROP TRIGGER IF EXISTS {quote_identifier(trigger_name)};"
+            for trigger_name in self._change_log_trigger_names().values()
+        ]
+        trigger_sql.extend(
+            self._change_log_trigger_sql(operation) + ";"
+            for operation in ("INSERT", "UPDATE", "DELETE")
+        )
+        trigger_sql = "\n".join(trigger_sql)
+        with self.db.atomic():
+            self.db.execute(
+                f"INSERT INTO {quote_identifier(_CHANGE_LOG_TRACKED_TABLE_NAME)} "
+                '("table", pk_columns, enabled) VALUES (?, ?, 1) '
+                "ON CONFLICT(\"table\") DO UPDATE SET "
+                "pk_columns = excluded.pk_columns, enabled = 1",
+                (self.name, json.dumps(pk_columns)),
+            )
+            self.db._executescript(trigger_sql)
+        return self
+
+    def disable_changes(self) -> "Table":
+        "Disable change logging without deleting retained change log events."
+        if not self.exists() or not self.db._change_log_exists():
+            return self
+        existing_triggers = self.triggers_dict
+        trigger_sql = []
+        for trigger_name in self._change_log_trigger_names().values():
+            sql = existing_triggers.get(trigger_name)
+            if sql is not None:
+                if _CHANGE_LOG_TRIGGER_MARKER not in sql:
+                    raise AlterError(
+                        f"Refusing to drop trigger {trigger_name}: it was not created by sqlite-utils"
+                    )
+                trigger_sql.append(f"DROP TRIGGER {quote_identifier(trigger_name)};")
+        with self.db.atomic():
+            if trigger_sql:
+                self.db._executescript("\n".join(trigger_sql))
+            self.db.execute(
+                f"UPDATE {quote_identifier(_CHANGE_LOG_TRACKED_TABLE_NAME)} "
+                "SET enabled = 0 "
+                'WHERE "table" = ?',
+                (self.name,),
+            )
+        return self
+
+    @property
+    def has_changes_triggers(self) -> bool:
+        "Does this table have sqlite-utils change log triggers?"
+        trigger_names = set(self._change_log_trigger_names().values())
+        existing = self.triggers_dict
+        return trigger_names.issubset(existing) and all(
+            _CHANGE_LOG_TRIGGER_MARKER in existing[name] for name in trigger_names
+        )
+
+    def changes(
+        self,
+        cursor: int = 0,
+        *,
+        limit: int = 100,
+        consumer: str = "default",
+        consumer_id: str | None = None,
+        batch_size: int | None = None,
+    ) -> ChangeLogBatch:
+        """
+        Read a batch of logged changes at or after an opaque incremental cursor.
+
+        The cursor is confirmed separately with :meth:`Database.acknowledge_changes`.
+        """
+        return self.db.read_changes(
+            cursor,
+            table=self.name,
+            limit=limit,
+            consumer=consumer,
+            consumer_id=consumer_id,
+            batch_size=batch_size,
+        )
+
+    def read_changes(
+        self,
+        cursor: int = 0,
+        *,
+        limit: int = 100,
+        consumer: str = "default",
+        consumer_id: str | None = None,
+        batch_size: int | None = None,
+    ) -> ChangeLogBatch:
+        return self.changes(
+            cursor,
+            limit=limit,
+            consumer=consumer,
+            consumer_id=consumer_id,
+            batch_size=batch_size,
+        )
+
+    def acknowledge_changes(
+        self,
+        cursor: int,
+        *,
+        consumer: str = "default",
+        consumer_id: str | None = None,
+    ) -> int:
+        return self.db.acknowledge_changes(
+            cursor, table=self.name, consumer=consumer, consumer_id=consumer_id
+        )
+
+    def ack_changes(
+        self,
+        cursor: int,
+        *,
+        consumer: str = "default",
+        consumer_id: str | None = None,
+    ) -> int:
+        return self.acknowledge_changes(
+            cursor, consumer=consumer, consumer_id=consumer_id
+        )
+
+    def change_log_watermark(self, consumer: str = "default") -> int | None:
+        return self.db.change_log_watermark(consumer, table=self.name)
+
+    def prune_changes(
+        self, *, consumer: str = "default", consumer_id: str | None = None
+    ) -> int:
+        "Delete retained changes up to a consumer's confirmed cursor."
+        return self.db.prune_changes(
+            consumer=consumer, consumer_id=consumer_id, table=self.name
+        )
 
     @property
     def has_counts_triggers(self) -> bool:
