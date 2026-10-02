@@ -979,7 +979,7 @@ You can set default values for these methods by accessing the table through the 
     # Now you can call .insert() like so:
     table.insert({"id": 1, "name": "Tracy", "score": 5})
 
-The configuration options that can be specified in this way are ``pk``, ``foreign_keys``, ``column_order``, ``not_null``, ``defaults``, ``batch_size``, ``hash_id``, ``hash_id_columns``, ``alter``, ``ignore``, ``replace``, ``extracts``, ``conversions``, ``columns``, ``strict``. These are all documented below.
+The configuration options that can be specified in this way are ``pk``, ``foreign_keys``, ``column_order``, ``not_null``, ``defaults``, ``batch_size``, ``hash_id``, ``hash_id_columns``, ``hash_id_mode``, ``alter``, ``ignore``, ``replace``, ``extracts``, ``conversions``, ``columns``, ``strict``. These are all documented below.
 
 .. _python_api_defaults_not_null:
 
@@ -2265,6 +2265,36 @@ The hash will be created using all of the column values. To create a hash using 
 The ``hash_id=`` parameter is optional if you specify ``hash_id_columns=`` - it will default to putting the hash in a column called ``id``.
 
 You can manually calculate these hashes using the :ref:`hash_record(record, keys=...) <reference_utils_hash_record>` utility function.
+
+.. _python_api_hash_v1:
+
+Versioned hash mode
+-------------------
+
+The default hashing rule (``hash_id_mode="legacy"``) is a SHA1 hash of a JSON serialization of the row. It is kept for backwards compatibility, but it depends on ``repr()`` for non-JSON values and offers no type boundaries between values such as ``1`` and ``True``.
+
+Pass ``hash_id_mode="v1"`` to opt into a versioned, deterministic hashing rule designed for long-term reuse as a content identity::
+
+    db.table("dogs").upsert(
+        {"name": "Cleo", "twitter": "cleopaws"},
+        hash_id="id",
+        hash_id_mode="v1",
+    )
+
+The ``v1`` mode hashes a canonical encoding of the participating fields with these properties:
+
+- Dictionary key order does not affect the hash, but list order does
+- Missing fields are hashed differently from fields that are present with a value of ``None``
+- Booleans, integers, floats, strings, bytes and ``Decimal`` values each have distinct type boundaries - ``True``, ``1`` and ``"1"`` all hash differently
+- Floats are encoded as big-endian IEEE 754 bytes (never via ``repr()`` or locale-sensitive formatting), with ``-0.0`` normalized to ``0.0`` and NaN and infinity mapped to fixed markers
+- ``Decimal`` values are normalized, so ``Decimal("1.0")`` and ``Decimal("1.00")`` hash the same
+- The hash input includes a version identifier and the identity of the participating fields, so two different field sets can never accidentally share a hash namespace
+
+The same rule is used by ``insert()``, ``insert_all()``, ``upsert()`` and ``upsert_all()``, and the input records are never modified. Values that cannot be hashed (unsupported types, or dictionaries with non-string keys) raise a ``TypeError`` before anything is written.
+
+You can calculate these hashes yourself using ``sqlite_utils.utils.hash_record_v1(record, keys=...)``.
+
+Rows written with the legacy mode keep their original primary keys - the two modes live in separate namespaces, so a legacy hash will never be reinterpreted as a ``v1`` hash or vice versa.
 
 .. _python_api_create_view:
 

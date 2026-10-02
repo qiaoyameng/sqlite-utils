@@ -48,6 +48,7 @@ from .utils import (
     dedupe_keys,
     find_spatialite,
     hash_record,
+    hash_record_v1,
     progressbar,
     sqlite3,
     suggest_column_types,
@@ -150,6 +151,32 @@ def fold_identifier_case(identifier: str) -> str:
     characters are folded, other characters are left unchanged.
     """
     return identifier.translate(_IDENTIFIER_CASEFOLD)
+
+
+HASH_ID_MODES = ("legacy", "v1")
+
+
+def validate_hash_id_mode(hash_id_mode: str | None) -> None:
+    if hash_id_mode is not None and hash_id_mode not in HASH_ID_MODES:
+        raise ValueError(
+            f"hash_id_mode must be one of {HASH_ID_MODES}, got {hash_id_mode!r}"
+        )
+
+
+def hash_record_for_mode(
+    record: dict[str, Any],
+    hash_id_columns: Iterable[str] | None,
+    hash_id_mode: str | None,
+) -> str:
+    """
+    Hash a record using the requested hash_id mode. ``None`` and ``"legacy"``
+    use the original SHA1 JSON-based rule, ``"v1"`` uses the versioned
+    deterministic encoding from :func:`sqlite_utils.utils.hash_record_v1`.
+    """
+    validate_hash_id_mode(hash_id_mode)
+    if hash_id_mode == "v1":
+        return hash_record_v1(record, hash_id_columns)
+    return hash_record(record, hash_id_columns)
 
 
 def resolve_casing(name: str, candidates: Iterable[str]) -> str:
@@ -2268,6 +2295,8 @@ class Table(Queryable):
     :param hash_id: Name of a column to create and use as a primary key, where the
       value of that primary key is derived from a hash of the row values
     :param hash_id_columns: List of columns to use for the hash_id
+    :param hash_id_mode: Hashing rule to use for the hash_id - ``"legacy"`` (the
+      default) or ``"v1"`` for the versioned deterministic encoding
     :param alter: If True, automatically alter the table if it doesn't match the schema
     :param ignore: If True, ignore rows that already exist when inserting
     :param replace: If True, replace rows that already exist when inserting
@@ -2294,6 +2323,7 @@ class Table(Queryable):
         batch_size: int = 100,
         hash_id: str | None = None,
         hash_id_columns: Iterable[str] | None = None,
+        hash_id_mode: str | None = None,
         alter: bool = False,
         ignore: bool = False,
         replace: bool = False,
@@ -2312,6 +2342,7 @@ class Table(Queryable):
             "batch_size": batch_size,
             "hash_id": hash_id,
             "hash_id_columns": hash_id_columns,
+            "hash_id_mode": hash_id_mode,
             "alter": alter,
             "ignore": ignore,
             "replace": replace,
@@ -4309,6 +4340,7 @@ class Table(Queryable):
         all_columns,
         hash_id,
         hash_id_columns,
+        hash_id_mode,
         upsert,
         pk,
         not_null,
@@ -4345,6 +4377,17 @@ class Table(Queryable):
         if hash_id_columns and hash_id is None:
             hash_id = "id"
 
+        # Hash every record up-front so an unhashable value fails before
+        # any row from this chunk is written
+        record_hashes: list[str] = []
+        if hash_id and not list_mode:
+            for record in chunk:
+                record_hashes.append(
+                    hash_record_for_mode(
+                        cast(dict[str, Any], record), hash_id_columns, hash_id_mode
+                    )
+                )
+
         extracts = resolve_extracts(extracts)
 
         # Build a row-list ready for executemany-style flattening
@@ -4373,7 +4416,7 @@ class Table(Queryable):
                 values.append(record_values)
         else:
             # Dict mode: original logic
-            for record in chunk:
+            for record_index, record in enumerate(chunk):
                 record_values = []
                 for key in all_columns:
                     value = jsonify_if_needed(
@@ -4382,7 +4425,7 @@ class Table(Queryable):
                             (
                                 None
                                 if key != hash_id
-                                else hash_record(record, hash_id_columns)
+                                else record_hashes[record_index]
                             ),
                         )
                     )
@@ -4525,6 +4568,7 @@ class Table(Queryable):
         all_columns,
         hash_id,
         hash_id_columns,
+        hash_id_mode,
         upsert,
         pk,
         not_null,
@@ -4540,6 +4584,7 @@ class Table(Queryable):
             all_columns,
             hash_id,
             hash_id_columns,
+            hash_id_mode,
             upsert,
             pk,
             not_null,
@@ -4570,6 +4615,7 @@ class Table(Queryable):
                             all_columns,
                             hash_id,
                             hash_id_columns,
+                            hash_id_mode,
                             upsert,
                             pk,
                             not_null,
@@ -4587,6 +4633,7 @@ class Table(Queryable):
                             all_columns,
                             hash_id,
                             hash_id_columns,
+                            hash_id_mode,
                             upsert,
                             pk,
                             not_null,
@@ -4611,6 +4658,7 @@ class Table(Queryable):
         defaults: dict[str, Any] | Default | None = DEFAULT,
         hash_id: str | Default | None = DEFAULT,
         hash_id_columns: Iterable[str] | Default | None = DEFAULT,
+        hash_id_mode: str | Default | None = DEFAULT,
         alter: bool | Default | None = DEFAULT,
         ignore: bool | Default | None = DEFAULT,
         replace: bool | Default | None = DEFAULT,
@@ -4641,6 +4689,8 @@ class Table(Queryable):
         :param hash_id: Name of a column to create and use as a primary key, where the
           value of that primary key will be derived as a SHA1 hash of the other column values
           in the record. ``hash_id="id"`` is a common column name used for this.
+        :param hash_id_mode: Hashing rule for the hash_id - ``"legacy"`` (default) or
+          ``"v1"`` for the versioned deterministic encoding
         :param alter: Boolean, should any missing columns be added automatically?
         :param ignore: Boolean, if a record already exists with this primary key, ignore this insert.
         :param replace: Boolean, if a record already exists with this primary key, replace it with this new record.
@@ -4661,6 +4711,7 @@ class Table(Queryable):
             defaults=defaults,
             hash_id=hash_id,
             hash_id_columns=hash_id_columns,
+            hash_id_mode=hash_id_mode,
             alter=alter,
             ignore=ignore,
             replace=replace,
@@ -4681,6 +4732,7 @@ class Table(Queryable):
         batch_size: int | Default = DEFAULT,
         hash_id: str | Default | None = DEFAULT,
         hash_id_columns: Iterable[str] | Default | None = DEFAULT,
+        hash_id_mode: str | Default | None = DEFAULT,
         alter: bool | Default | None = DEFAULT,
         ignore: bool | Default | None = DEFAULT,
         replace: bool | Default | None = DEFAULT,
@@ -4706,6 +4758,7 @@ class Table(Queryable):
         batch_size = self.value_or_default("batch_size", batch_size)
         hash_id = self.value_or_default("hash_id", hash_id)
         hash_id_columns = self.value_or_default("hash_id_columns", hash_id_columns)
+        hash_id_mode = self.value_or_default("hash_id_mode", hash_id_mode)
         alter = self.value_or_default("alter", alter)
         ignore = self.value_or_default("ignore", ignore)
         replace = self.value_or_default("replace", replace)
@@ -4716,6 +4769,9 @@ class Table(Queryable):
 
         if hash_id_columns and hash_id is None:
             hash_id = "id"
+
+        # Validate before anything is written
+        validate_hash_id_mode(cast(str | None, hash_id_mode))
 
         if upsert and not pk and not hash_id and self.exists():
             existing_pks = [column.name for column in self.columns if column.is_pk]
@@ -4828,6 +4884,15 @@ class Table(Queryable):
             chunk = list(chunk)
             num_records_processed += len(chunk)
             if first:
+                if hash_id and not list_mode:
+                    # Fail fast on unhashable values, before the table is
+                    # created or anything is written
+                    for record in chunk:
+                        hash_record_for_mode(
+                            cast(dict[str, Any], record),
+                            hash_id_columns,
+                            hash_id_mode,
+                        )
                 if not self.exists():
                     # Use the first batch to derive the table names
                     if list_mode:
@@ -4894,6 +4959,7 @@ class Table(Queryable):
                 all_columns,
                 hash_id,
                 hash_id_columns,
+                hash_id_mode,
                 upsert,
                 pk,
                 not_null,
@@ -4921,7 +4987,9 @@ class Table(Queryable):
                     else:
                         first_record_dict = cast(dict[str, Any], first_record)
                     if hash_id:
-                        self.last_pk = hash_record(first_record_dict, hash_id_columns)
+                        self.last_pk = hash_record_for_mode(
+                            first_record_dict, hash_id_columns, hash_id_mode
+                        )
                     elif isinstance(pk, str):
                         self.last_pk = first_record_dict[
                             resolve_casing(pk, first_record_dict)
@@ -5011,7 +5079,9 @@ class Table(Queryable):
                 else:
                     first_record_dict = cast(dict[str, Any], first_record)
                     if hash_id:
-                        self.last_pk = hash_record(first_record_dict, hash_id_columns)
+                        self.last_pk = hash_record_for_mode(
+                            first_record_dict, hash_id_columns, hash_id_mode
+                        )
                     else:
                         assert pk is not None
                         self.last_pk = (
@@ -5038,6 +5108,7 @@ class Table(Queryable):
         defaults: dict[str, Any] | Default | None = DEFAULT,
         hash_id: str | Default | None = DEFAULT,
         hash_id_columns: Iterable[str] | Default | None = DEFAULT,
+        hash_id_mode: str | Default | None = DEFAULT,
         alter: bool | Default | None = DEFAULT,
         extracts: dict[str, str] | list[str] | Default | None = DEFAULT,
         conversions: dict[str, str] | Default | None = DEFAULT,
@@ -5059,6 +5130,7 @@ class Table(Queryable):
             defaults=defaults,
             hash_id=hash_id,
             hash_id_columns=hash_id_columns,
+            hash_id_mode=hash_id_mode,
             alter=alter,
             extracts=extracts,
             conversions=conversions,
@@ -5077,6 +5149,7 @@ class Table(Queryable):
         batch_size: int | Default = DEFAULT,
         hash_id: str | Default | None = DEFAULT,
         hash_id_columns: Iterable[str] | Default | None = DEFAULT,
+        hash_id_mode: str | Default | None = DEFAULT,
         alter: bool | Default | None = DEFAULT,
         extracts: dict[str, str] | list[str] | Default | None = DEFAULT,
         conversions: dict[str, str] | Default | None = DEFAULT,
@@ -5097,6 +5170,7 @@ class Table(Queryable):
             batch_size=batch_size,
             hash_id=hash_id,
             hash_id_columns=hash_id_columns,
+            hash_id_mode=hash_id_mode,
             alter=alter,
             extracts=extracts,
             conversions=conversions,

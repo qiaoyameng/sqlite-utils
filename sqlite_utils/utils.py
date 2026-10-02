@@ -1,19 +1,23 @@
 import base64
 import contextlib
 import csv
+import decimal
 import enum
 import hashlib
 import importlib
 import io
 import itertools
 import json
+import math
 import os
+import struct
 import sys
 from collections.abc import Callable, Generator, Iterable, Iterator
 from typing import (
     TYPE_CHECKING,
     Any,
     BinaryIO,
+    ClassVar,
     Generic,
     TypeVar,
     Union,
@@ -614,6 +618,167 @@ def hash_record(record: dict[str, Any], keys: Iterable[str] | None = None) -> st
         json.dumps(to_hash, separators=(",", ":"), sort_keys=True, default=repr).encode(
             "utf8"
         )
+    ).hexdigest()
+
+
+# Version identifier mixed into every versioned hash, so hashes produced by
+# different rules can never share a namespace.
+HASH_RECORD_V1_VERSION = "sqlite-utils-hash-record-v1"
+
+
+class _MissingType:
+    "Sentinel for a field that is absent from a record - distinct from None."
+
+    _instance: "ClassVar[_MissingType | None]" = None
+
+    def __new__(cls) -> "_MissingType":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "MISSING"
+
+
+MISSING = _MissingType()
+
+
+def _encode_length(length: int) -> bytes:
+    return str(length).encode("ascii") + b":"
+
+
+def _encode_float_canonical(value: float) -> bytes:
+    if math.isnan(value):
+        return b"nan"
+    if math.isinf(value):
+        return b"+inf" if value > 0 else b"-inf"
+    if value == 0.0:
+        # Normalize -0.0 to +0.0
+        return struct.pack(">d", 0.0)
+    return struct.pack(">d", value)
+
+
+def _encode_decimal_canonical(value: decimal.Decimal) -> bytes:
+    if value.is_nan():
+        return b"nan"
+    if value.is_infinite():
+        return b"+inf" if value > 0 else b"-inf"
+    tuple_ = value.as_tuple()
+    digits = list(tuple_.digits)
+    exponent = cast(int, tuple_.exponent)
+    # Strip trailing zeros so Decimal("1.0") == Decimal("1.00")
+    while len(digits) > 1 and digits[-1] == 0:
+        digits.pop()
+        exponent += 1
+    # Strip leading zeros
+    while len(digits) > 1 and digits[0] == 0:
+        digits.pop(0)
+    sign = tuple_.sign
+    if all(digit == 0 for digit in digits):
+        # Normalize zero: -0 == 0, exponent irrelevant
+        sign = 0
+        digits = [0]
+        exponent = 0
+    return (
+        str(sign).encode("ascii")
+        + b"|"
+        + str(exponent).encode("ascii")
+        + b"|"
+        + "".join(str(digit) for digit in digits).encode("ascii")
+    )
+
+
+def _encode_canonical(value: Any) -> bytes:
+    """
+    Encode a value as bytes using deterministic, type-tagged rules:
+
+    - Mapping keys are sorted, so key order does not affect the encoding
+    - List order is significant
+    - Missing fields, nulls, booleans, integers, strings and bytes each
+      have their own type tag and cannot collide
+    - Floats use big-endian IEEE 754 bytes (never ``repr()`` or locale),
+      with ``-0.0`` normalized to ``0.0`` and NaN/infinity as fixed tags
+    - Decimals are normalized so ``1.0`` equals ``1.00``
+    """
+    if value is None:
+        return b"\x00"
+    if value is MISSING:
+        return b"\x01"
+    if isinstance(value, bool):
+        # Must be checked before int - bool is a subclass of int
+        return b"\x02" + (b"\x01" if value else b"\x00")
+    if isinstance(value, int):
+        return b"\x03" + str(value).encode("ascii")
+    if isinstance(value, float):
+        return b"\x04" + _encode_float_canonical(value)
+    if isinstance(value, decimal.Decimal):
+        return b"\x05" + _encode_decimal_canonical(value)
+    if isinstance(value, str):
+        encoded = value.encode("utf-8")
+        return b"\x06" + _encode_length(len(encoded)) + encoded
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+        return b"\x07" + _encode_length(len(raw)) + raw
+    if isinstance(value, (list, tuple)):
+        items = [_encode_canonical(item) for item in value]
+        return b"\x08" + _encode_length(len(items)) + b"".join(items)
+    if isinstance(value, dict):
+        encoded_items = []
+        for key, item_value in value.items():
+            if not isinstance(key, str):
+                raise TypeError(
+                    "hash_record_v1() requires string dictionary keys, "
+                    f"got {type(key).__name__}"
+                )
+            encoded_items.append(
+                (_encode_canonical(key), _encode_canonical(item_value))
+            )
+        encoded_items.sort()
+        return b"\x09" + _encode_length(len(encoded_items)) + b"".join(
+            encoded_key + encoded_value for encoded_key, encoded_value in encoded_items
+        )
+    raise TypeError(
+        f"hash_record_v1() cannot hash values of type {type(value).__name__}"
+    )
+
+
+def hash_record_v1(record: dict[str, Any], keys: Iterable[str] | None = None) -> str:
+    """
+    Versioned, deterministic hash of a record - an alternative to
+    :func:`hash_record` designed for long-term reuse as a content identity.
+
+    Unlike ``hash_record()`` this does not rely on ``repr()`` or JSON
+    serialization. Values are encoded with explicit type tags, mapping keys
+    are sorted, and the hash input includes a version identifier plus the
+    identity of the participating fields - so two different field sets can
+    never accidentally produce the same hash namespace.
+
+    Fields listed in ``keys`` that are absent from the record are hashed as
+    a distinct "missing" marker, not as ``None``.
+
+    The input record is never modified.
+
+    Example usage::
+
+        from sqlite_utils.utils import hash_record_v1
+
+        hashed = hash_record_v1({"name": "Cleo", "twitter": "CleoPaws"})
+        hashed = hash_record_v1(
+            {"name": "Cleo", "twitter": "CleoPaws", "age": 7},
+            keys=("name", "twitter")
+        )
+
+    :param record: Record to generate a hash for
+    :param keys: Subset of keys to use for that hash
+    """
+    if keys is None:
+        selected = {key: record[key] for key in record}
+    else:
+        selected = {key: (record[key] if key in record else MISSING) for key in keys}
+    return hashlib.sha256(
+        HASH_RECORD_V1_VERSION.encode("utf-8")
+        + b"\x00"
+        + _encode_canonical(selected)
     ).hexdigest()
 
 
