@@ -4,6 +4,13 @@
  Changelog
 ===========
 
+.. _v4_3:
+
+4.3 (unreleased)
+----------------
+
+- New ``hash_id_version=1`` mode provides a versioned SHA-256 content identity for ``insert()``, ``insert_all()``, ``upsert()`` and ``upsert_all()``. The caller names participating fields with ``hash_id_columns=``; mappings are order-independent, lists are order-dependent, missing fields differ from ``NULL``, supported value types retain distinct boundaries, and non-finite values are rejected before any writes.
+
 .. _v4_2_1:
 
 4.2.1 (2026-08-13)

@@ -1,15 +1,18 @@
 import base64
 import contextlib
 import csv
+import decimal
 import enum
 import hashlib
 import importlib
 import io
 import itertools
 import json
+import math
 import os
+import struct
 import sys
-from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -57,6 +60,14 @@ RowValue = None | int | float | str | bytes | bool | list[str]
 Row = dict[str, RowValue]
 
 T = TypeVar("T")
+
+HASH_ID_VERSION_1 = 1
+_HASH_ID_V1_DOMAIN = b"SQLITE-UTILS-HASH-ID-V1\n"
+_HASH_ID_V1_MISSING = object()
+
+
+class HashIdError(ValueError):
+    """A value or field specification cannot be encoded in a content hash."""
 
 
 class ANY:
@@ -615,6 +626,94 @@ def hash_record(record: dict[str, Any], keys: Iterable[str] | None = None) -> st
             "utf8"
         )
     ).hexdigest()
+
+
+def hash_record_v1(record: Mapping[str, Any], keys: Iterable[str]) -> str:
+    """
+    Return a stable SHA-256 content ID for selected fields in ``record``.
+
+    Mappings are order-independent, lists and tuples are order-dependent, and
+    missing fields are distinct from ``None``.
+    """
+    field_names = tuple(sorted(keys))
+    if not field_names:
+        raise HashIdError("hash_id_columns must contain at least one field")
+    if any(not isinstance(key, str) for key in field_names):
+        raise HashIdError("hash_id_columns must contain only strings")
+    if len(set(field_names)) != len(field_names):
+        raise HashIdError("hash_id_columns must not contain duplicates")
+
+    encoded_fields = _hash_id_v1_frame(
+        b"A",
+        b"".join(
+            _hash_id_v1_frame(b"S", key.encode("utf-8")) for key in field_names
+        ),
+    )
+    try:
+        encoded_values = []
+        for key in field_names:
+            try:
+                value = record[key]
+            except KeyError:
+                value = _HASH_ID_V1_MISSING
+            encoded_values.append(_hash_id_v1_value(value))
+    except RecursionError as ex:
+        raise HashIdError("Cyclic values cannot be used in hash IDs") from ex
+    payload = (
+        _HASH_ID_V1_DOMAIN
+        + encoded_fields
+        + b"".join(
+            _hash_id_v1_frame(b"V", encoded_value)
+            for encoded_value in encoded_values
+        )
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _hash_id_v1_frame(tag: bytes, payload: bytes = b"") -> bytes:
+    return tag + struct.pack(">Q", len(payload)) + payload
+
+
+def _hash_id_v1_value(value: Any) -> bytes:
+    if value is _HASH_ID_V1_MISSING:
+        return _hash_id_v1_frame(b"E")
+    if value is None:
+        return _hash_id_v1_frame(b"N")
+    if isinstance(value, bool):
+        return _hash_id_v1_frame(b"T" if value else b"F")
+    if isinstance(value, int):
+        return _hash_id_v1_frame(b"I", str(value).encode("ascii"))
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise HashIdError("Non-finite floats cannot be used in hash IDs")
+        if value == 0:
+            value = 0.0
+        return _hash_id_v1_frame(b"R", struct.pack(">d", value))
+    if isinstance(value, decimal.Decimal):
+        if not value.is_finite():
+            raise HashIdError("Non-finite Decimals cannot be used in hash IDs")
+        decimal_value = str(value).encode("ascii")
+        return _hash_id_v1_frame(b"D", decimal_value)
+    if isinstance(value, str):
+        return _hash_id_v1_frame(b"S", value.encode("utf-8"))
+    if isinstance(value, (bytes, bytearray)):
+        return _hash_id_v1_frame(b"Y", bytes(value))
+    if isinstance(value, (list, tuple)):
+        return _hash_id_v1_frame(
+            b"A", b"".join(_hash_id_v1_value(item) for item in value)
+        )
+    if isinstance(value, Mapping):
+        entries = []
+        keys = list(value)
+        if any(not isinstance(key, str) for key in keys):
+            raise HashIdError("Mapping keys used in hash IDs must be strings")
+        for key in sorted(keys, key=lambda item: item.encode("utf-8")):
+            entries.append(
+                _hash_id_v1_frame(b"S", key.encode("utf-8"))
+                + _hash_id_v1_value(value[key])
+            )
+        return _hash_id_v1_frame(b"M", b"".join(entries))
+    raise HashIdError(f"Unsupported hash ID value type: {type(value).__name__}")
 
 
 def dedupe_keys(keys: Iterable[str]) -> list[str]:

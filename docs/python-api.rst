@@ -979,7 +979,7 @@ You can set default values for these methods by accessing the table through the 
     # Now you can call .insert() like so:
     table.insert({"id": 1, "name": "Tracy", "score": 5})
 
-The configuration options that can be specified in this way are ``pk``, ``foreign_keys``, ``column_order``, ``not_null``, ``defaults``, ``batch_size``, ``hash_id``, ``hash_id_columns``, ``alter``, ``ignore``, ``replace``, ``extracts``, ``conversions``, ``columns``, ``strict``. These are all documented below.
+The configuration options that can be specified in this way are ``pk``, ``foreign_keys``, ``column_order``, ``not_null``, ``defaults``, ``batch_size``, ``hash_id``, ``hash_id_columns``, ``hash_id_version``, ``alter``, ``ignore``, ``replace``, ``extracts``, ``conversions``, ``columns``, ``strict``. These are all documented below.
 
 .. _python_api_defaults_not_null:
 
@@ -2265,6 +2265,36 @@ The hash will be created using all of the column values. To create a hash using 
 The ``hash_id=`` parameter is optional if you specify ``hash_id_columns=`` - it will default to putting the hash in a column called ``id``.
 
 You can manually calculate these hashes using the :ref:`hash_record(record, keys=...) <reference_utils_hash_record>` utility function.
+
+Versioned hash IDs
+------------------
+
+The SHA-1 based hash above is retained for backwards compatibility, but its
+encoding does not distinguish every value type. For new stable content
+identities, pass ``hash_id_version=1`` and explicitly name the participating
+fields with ``hash_id_columns=``::
+
+    db.table("dogs").upsert(
+        {"name": "Cleo", "twitter": "cleopaws"},
+        hash_id="id",
+        hash_id_columns=("name", "twitter"),
+        hash_id_version=1,
+    )
+
+Version 1 uses a SHA-256 hash. The hash input includes the version marker and
+the participating field names, so two different field sets do not share a
+namespace. Field order does not matter, while list order does. A missing field
+is encoded differently from ``None``, and booleans, integers, strings, byte
+strings, floats and :py:class:`decimal.Decimal` values retain separate type
+boundaries.
+
+Floating point negative zero is treated as positive zero. ``NaN``, positive
+infinity and negative infinity are rejected. Decimal values are encoded exactly
+without conversion through a floating point value, ``repr()`` or the current
+locale. Unsupported values raise before any insert or upsert writes are made.
+
+The equivalent utility function is
+:ref:`hash_record_v1(record, keys) <reference_utils_hash_record_v1>`.
 
 .. _python_api_create_view:
 
